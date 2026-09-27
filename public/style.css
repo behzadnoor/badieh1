@@ -1,5 +1,8 @@
 :root{--bg:#f7f6f3;--card:#fff;--ink:#1e1c1a;--muted:#8a8580;--accent:#a8562f;--line:#e8e4de;}
 @media (prefers-color-scheme: dark){:root{--bg:#171512;--card:#221f1c;--ink:#f0ede8;--muted:#9a958e;--accent:#d97a4d;--line:#332f2a;}}
+/* manual theme toggle overrides system preference when set */
+:root[data-theme="light"]{--bg:#f7f6f3;--card:#fff;--ink:#1e1c1a;--muted:#8a8580;--accent:#a8562f;--line:#e8e4de;}
+:root[data-theme="dark"]{--bg:#171512;--card:#221f1c;--ink:#f0ede8;--muted:#9a958e;--accent:#d97a4d;--line:#332f2a;}
 *{box-sizing:border-box}
 body{margin:0;font-family:Tahoma,Vazirmatn,sans-serif;background:var(--bg);color:var(--ink);min-height:100vh}
 input,textarea,select,button{font-family:inherit;font-size:14px}

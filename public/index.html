@@ -3,14 +3,14 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>انجمن گفتگو</title>
+<title>راه بادیه مجازی</title>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
 
 <div id="authScreen" class="auth-screen">
   <div class="auth-card">
-    <h1>🗣️ انجمن گفتگو</h1>
+    <h1>🗣️ راه بادیه مجازی</h1>
     <div class="tabs">
       <button id="tabLogin" class="tab active">ورود</button>
       <button id="tabRegister" class="tab">ثبت‌نام</button>
@@ -24,7 +24,9 @@
     <form id="registerForm" style="display:none">
       <input type="text" id="regDisplayName" placeholder="نام نمایشی" required>
       <input type="text" id="regUsername" placeholder="نام کاربری" required>
+      <input type="tel" id="regPhone" placeholder="شماره موبایل (مثال: 0912xxxxxxx)" required>
       <input type="password" id="regPassword" placeholder="رمز عبور (حداقل ۴ کاراکتر)" required>
+      <input type="password" id="regConfirmPassword" placeholder="تکرار رمز عبور" required>
       <button type="submit">ثبت‌نام</button>
       <p class="hint">اولین کسی که ثبت‌نام کنه، خودکار مدیر سایت می‌شه. بقیه تا زمان تایید مدیر فقط می‌تونن بخونن.</p>
       <p class="err" id="regErr"></p>
@@ -34,10 +36,12 @@
 
 <div id="appScreen" class="app-screen" style="display:none">
   <header>
-    <h1>🗣️ انجمن گفتگو</h1>
+    <h1>🗣️ راه بادیه مجازی</h1>
     <input id="searchBox" type="search" placeholder="جستجو در پیام‌ها...">
     <span id="whoami"></span>
     <button class="ghost" id="dmBtn">پیام خصوصی</button>
+    <button class="ghost" id="themeColorBtn">🎨 رنگ</button>
+    <button class="ghost" id="themeToggleBtn">🌓</button>
     <button class="ghost" id="adminBtn" style="display:none">مدیریت</button>
     <button class="ghost" id="logoutBtn">خروج</button>
   </header>

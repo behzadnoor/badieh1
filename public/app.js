@@ -36,8 +36,13 @@ $('#loginForm').onsubmit = async (e)=>{
 $('#registerForm').onsubmit = async (e)=>{
   e.preventDefault();
   $('#regErr').textContent='';
+  const password = $('#regPassword').value;
+  const confirmPassword = $('#regConfirmPassword').value;
+  const phone = $('#regPhone').value.trim();
+  if(password !== confirmPassword){ $('#regErr').textContent = 'رمز عبور و تکرار آن یکسان نیستند'; return; }
+  if(!/^(0|\+98|0098)?9\d{9}$/.test(phone.replace(/[^\d+]/g,''))){ $('#regErr').textContent = 'شماره موبایل معتبر وارد کنید (مثال: 0912xxxxxxx)'; return; }
   try{
-    const { user } = await api('/api/auth/register', { method:'POST', body:{ username: $('#regUsername').value, password: $('#regPassword').value, displayName: $('#regDisplayName').value }});
+    const { user } = await api('/api/auth/register', { method:'POST', body:{ username: $('#regUsername').value, password, confirmPassword, phone, displayName: $('#regDisplayName').value }});
     startApp(user);
   }catch(err){ $('#regErr').textContent = err.message; }
 };
@@ -173,14 +178,10 @@ async function setRole(id, role){ await api(`/api/users/${id}/role`, { method:'P
 
 // ---------------- direct messages ----------------
 $('#dmBtn').onclick = async ()=>{
-  const { users } = await api('/api/users').catch(()=>({users:[]}));
-  let list = users;
-  if(!users.length){
-    // non-admins can't list all users via /api/users; fall back to online users
-    list = Object.entries(onlineMap).map(([id,u])=>({id, displayName:u.displayName}));
-  }
+  const { users } = await api('/api/members').catch(()=>({users:[]}));
+  const list = users.filter(u=>u.id!==me.id).map(u=>({...u, online: !!(onlineMap[u.id] && !onlineMap[u.id].offline)}));
   openModal(`<h3>پیام خصوصی</h3>
-    <div>${list.filter(u=>u.id!==me.id).map(u=>`<div class="userRow" style="cursor:pointer" onclick="openDm('${u.id}','${esc(u.displayName)}')">${esc(u.displayName)}</div>`).join('') || '<p style="font-size:12px;color:var(--muted)">کاربر دیگری یافت نشد</p>'}</div>
+    <div>${list.map(u=>`<div class="userRow" style="cursor:pointer" onclick="openDm('${u.id}','${esc(u.displayName)}')"><span><span class="dot ${u.online?'':'off'}"></span> ${esc(u.displayName)}</span></div>`).join('') || '<p style="font-size:12px;color:var(--muted)">کاربر دیگری یافت نشد</p>'}</div>
     <div style="margin-top:12px;text-align:left"><button class="ghost" onclick="closeModal()">بستن</button></div>`);
 };
 async function openDm(userId, name){
@@ -203,3 +204,30 @@ function appendDmMsg(m){
   list.insertAdjacentHTML('beforeend', dmRowHtml(m));
   list.scrollTop = list.scrollHeight;
 }
+
+// ---------------- theme (dark/light + accent color) ----------------
+const ACCENTS = ['#a8562f','#2f6ea8','#2f8a55','#8a2f8a','#c0392b','#b8860b'];
+function applyTheme(){
+  const mode = localStorage.getItem('themeMode') || 'system';
+  if(mode==='system') document.documentElement.removeAttribute('data-theme');
+  else document.documentElement.setAttribute('data-theme', mode);
+  const accent = localStorage.getItem('themeAccent');
+  if(accent) document.documentElement.style.setProperty('--accent', accent);
+  const btn = $('#themeToggleBtn');
+  if(btn) btn.textContent = mode==='dark' ? '☀️' : (mode==='light' ? '🌙' : '🌓');
+}
+applyTheme();
+$('#themeToggleBtn').onclick = ()=>{
+  const cur = localStorage.getItem('themeMode') || 'system';
+  const next = cur==='light' ? 'dark' : (cur==='dark' ? 'system' : 'light');
+  localStorage.setItem('themeMode', next);
+  applyTheme();
+};
+$('#themeColorBtn').onclick = ()=>{
+  openModal(`<h3>رنگ زمینه</h3>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+      ${ACCENTS.map(c=>`<div onclick="setAccent('${c}')" style="width:32px;height:32px;border-radius:50%;background:${c};cursor:pointer;border:2px solid var(--line)"></div>`).join('')}
+    </div>
+    <div style="text-align:left"><button class="ghost" onclick="closeModal()">بستن</button></div>`);
+};
+function setAccent(c){ localStorage.setItem('themeAccent', c); applyTheme(); closeModal(); }

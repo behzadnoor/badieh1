@@ -65,10 +65,19 @@ function publicUser(u) {
 }
 
 // ---------- auth ----------
+const PHONE_REGEX = /^(0|\+98|0098)?9\d{9}$/;
+
 app.post('/api/auth/register', (req, res) => {
-  const { username, password, displayName } = req.body || {};
+  const { username, password, confirmPassword, displayName, phone } = req.body || {};
   if (!username || !password || password.length < 4) {
     return res.status(400).json({ error: 'نام کاربری و رمز عبور (حداقل ۴ کاراکتر) لازم است' });
+  }
+  if (confirmPassword !== undefined && password !== confirmPassword) {
+    return res.status(400).json({ error: 'رمز عبور و تکرار آن یکسان نیستند' });
+  }
+  const phoneNormalized = (phone || '').replace(/[^\d+]/g, '');
+  if (!phoneNormalized || !PHONE_REGEX.test(phoneNormalized)) {
+    return res.status(400).json({ error: 'شماره موبایل معتبر وارد کنید (مثال: 0912xxxxxxx)' });
   }
   if (db.get('users').find({ username }).value()) {
     return res.status(400).json({ error: 'این نام کاربری قبلا ثبت شده' });
@@ -77,6 +86,7 @@ app.post('/api/auth/register', (req, res) => {
   const user = {
     id: uuid(),
     username,
+    phone: phoneNormalized,
     passwordHash: bcrypt.hashSync(password, 10),
     displayName: displayName || username,
     role: isFirstUser ? 'admin' : 'pending', // first registered user becomes admin automatically
@@ -111,6 +121,17 @@ app.get('/api/users', requireAuth, requireRole('admin'), (req, res) => {
   res.json({ users: db.get('users').map(publicUser).value() });
 });
 
+// list of approved members (admin + member), for anyone to start a DM with —
+// unlike /api/users this is not admin-only, so regular members can message
+// people who are currently offline too.
+app.get('/api/members', requireAuth, (req, res) => {
+  const members = db.get('users')
+    .filter(u => ['admin', 'member'].includes(u.role))
+    .map(publicUser)
+    .value();
+  res.json({ users: members });
+});
+
 app.post('/api/users/:id/role', requireAuth, requireRole('admin'), (req, res) => {
   const { role } = req.body || {};
   if (!['admin', 'member', 'pending', 'blocked'].includes(role)) {
@@ -140,7 +161,10 @@ app.post('/api/topics', requireAuth, requireRole('admin'), (req, res) => {
 app.post('/api/topics/:id/pdf', requireAuth, requireRole('admin'), upload.single('pdf'), (req, res) => {
   const topic = db.get('topics').find({ id: req.params.id });
   if (!topic.value()) return res.status(404).json({ error: 'تاپیک پیدا نشد' });
-  topic.assign({ pdfFile: req.file.filename, pdfName: req.file.originalname }).write();
+  // multer/busboy decode non-ASCII original filenames as latin1 by default,
+  // which garbles Persian/UTF-8 names — re-decode them correctly here.
+  const fixedName = Buffer.from(req.file.originalname, 'latin1').toString('utf8');
+  topic.assign({ pdfFile: req.file.filename, pdfName: fixedName }).write();
   io.emit('topicUpdated', topic.value());
   res.json({ topic: topic.value() });
 });
