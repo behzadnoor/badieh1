@@ -1,0 +1,18 @@
+{
+  "name": "forum-app",
+  "version": "1.0.0",
+  "description": "انجمن گفتگوی ساده - تاپیک، پاسخ، ری اکشن، آپلود PDF، پیام خصوصی، پنل مدیریت",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "express-session": "^1.18.0",
+    "bcryptjs": "^2.4.3",
+    "lowdb": "^1.0.0",
+    "multer": "^2.0.1",
+    "socket.io": "^4.7.5",
+    "uuid": "^9.0.1"
+  }
+}

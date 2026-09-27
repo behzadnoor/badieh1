@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>انجمن گفتگو</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<div id="authScreen" class="auth-screen">
+  <div class="auth-card">
+    <h1>🗣️ انجمن گفتگو</h1>
+    <div class="tabs">
+      <button id="tabLogin" class="tab active">ورود</button>
+      <button id="tabRegister" class="tab">ثبت‌نام</button>
+    </div>
+    <form id="loginForm">
+      <input type="text" id="loginUsername" placeholder="نام کاربری" required>
+      <input type="password" id="loginPassword" placeholder="رمز عبور" required>
+      <button type="submit">ورود</button>
+      <p class="err" id="loginErr"></p>
+    </form>
+    <form id="registerForm" style="display:none">
+      <input type="text" id="regDisplayName" placeholder="نام نمایشی" required>
+      <input type="text" id="regUsername" placeholder="نام کاربری" required>
+      <input type="password" id="regPassword" placeholder="رمز عبور (حداقل ۴ کاراکتر)" required>
+      <button type="submit">ثبت‌نام</button>
+      <p class="hint">اولین کسی که ثبت‌نام کنه، خودکار مدیر سایت می‌شه. بقیه تا زمان تایید مدیر فقط می‌تونن بخونن.</p>
+      <p class="err" id="regErr"></p>
+    </form>
+  </div>
+</div>
+
+<div id="appScreen" class="app-screen" style="display:none">
+  <header>
+    <h1>🗣️ انجمن گفتگو</h1>
+    <input id="searchBox" type="search" placeholder="جستجو در پیام‌ها...">
+    <span id="whoami"></span>
+    <button class="ghost" id="dmBtn">پیام خصوصی</button>
+    <button class="ghost" id="adminBtn" style="display:none">مدیریت</button>
+    <button class="ghost" id="logoutBtn">خروج</button>
+  </header>
+  <div class="wrap">
+    <div class="side">
+      <h3>آنلاین</h3>
+      <div id="onlineList"></div>
+      <h3>اتاق‌ها</h3>
+      <div id="topicList"></div>
+      <button class="ghost" id="newTopicBtn" style="display:none">+ تاپیک جدید</button>
+    </div>
+    <div class="main" id="mainArea"></div>
+  </div>
+</div>
+
+<div id="modalRoot"></div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
