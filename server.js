@@ -23,7 +23,17 @@ if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir);
 // ---------- middleware ----------
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
-app.use('/uploads', express.static(uploadsDir));
+app.use((req, res, next) => { res.setHeader('X-Content-Type-Options', 'nosniff'); next(); });
+app.use('/uploads', express.static(uploadsDir, {
+  setHeaders: (res, filePath) => {
+    const base = path.basename(filePath);
+    // topic PDFs are stored without an extension — serve them as inline PDFs
+    if (!path.extname(base) && db.get('topics').find({ pdfFile: base }).value()) {
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', 'inline');
+    }
+  }
+}));
 
 const sessionMiddleware = session({
   secret: SESSION_SECRET,
@@ -42,6 +52,39 @@ const upload = multer({
     cb(null, true);
   }
 });
+
+// images + voice notes attached to messages
+const ATT_TYPES = {
+  'image/jpeg': ['image', '.jpg'], 'image/png': ['image', '.png'], 'image/gif': ['image', '.gif'], 'image/webp': ['image', '.webp'],
+  'audio/webm': ['audio', '.webm'], 'audio/ogg': ['audio', '.ogg'], 'audio/mpeg': ['audio', '.mp3'], 'audio/mp3': ['audio', '.mp3'],
+  'audio/mp4': ['audio', '.m4a'], 'audio/x-m4a': ['audio', '.m4a'], 'audio/aac': ['audio', '.aac'],
+  'audio/wav': ['audio', '.wav'], 'audio/x-wav': ['audio', '.wav']
+};
+const baseMime = (m) => String(m || '').split(';')[0].trim().toLowerCase();
+const attUpload = multer({
+  storage: multer.diskStorage({
+    destination: uploadsDir,
+    filename: (req, file, cb) => cb(null, uuid().replace(/-/g, '') + ATT_TYPES[baseMime(file.mimetype)][1])
+  }),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (!ATT_TYPES[baseMime(file.mimetype)]) return cb(new Error('فقط عکس (JPG/PNG/GIF/WEBP) و فایل صوتی مجاز است'));
+    cb(null, true);
+  }
+});
+function runUpload(mw, field) {
+  return (req, res, next) => mw.single(field)(req, res, (err) => {
+    if (err) return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'حجم فایل بیش از حد مجاز است' : err.message });
+    next();
+  });
+}
+// resolve an attachment id the current user uploaded into the snapshot stored on a message
+function takeAttachment(id, user) {
+  if (!id) return null;
+  const a = db.get('attachments').find({ id }).value();
+  if (!a || a.by !== user.id) return null;
+  return { url: '/uploads/' + a.file, kind: a.kind, name: a.name };
+}
 
 function currentUser(req) {
   if (!req.session.userId) return null;
@@ -83,6 +126,15 @@ function fixFileName(name) {
 // repair names that were already saved garbled before this fix
 db.get('topics').forEach(t => { if (t.pdfName) t.pdfName = fixFileName(t.pdfName); }).value();
 db.write();
+
+// one-time: make sure a general discussion hall exists and is listed first
+(function seedGeneralHall() {
+  if (db.get('meta').value().generalSeeded) return;
+  if (!db.get('topics').find({ title: 'گفتگوی عمومی' }).value()) {
+    db.get('topics').unshift({ id: uuid(), title: 'گفتگوی عمومی', description: 'بحث آزاد همه اعضا', pdfFile: null, pdfName: null, createdAt: Date.now() }).write();
+  }
+  db.set('meta.generalSeeded', true).write();
+})();
 
 const PHONE_REGEX = /^(0|\+98|0098)?9\d{9}$/;
 
@@ -132,7 +184,54 @@ app.post('/api/auth/logout', (req, res) => {
 });
 
 app.get('/api/me', (req, res) => {
-  res.json({ user: publicUser(currentUser(req)) });
+  const u = currentUser(req);
+  res.json({ user: u ? { ...publicUser(u), phone: u.phone || '' } : null });
+});
+
+app.patch('/api/me', requireAuth, (req, res) => {
+  const { displayName, phone, currentPassword, newPassword, confirmPassword } = req.body || {};
+  const changes = {};
+  if (displayName !== undefined) {
+    const n = String(displayName).trim();
+    if (n.length < 2 || n.length > 40) return res.status(400).json({ error: 'نام نمایشی باید بین ۲ تا ۴۰ کاراکتر باشد' });
+    changes.displayName = n;
+  }
+  if (phone !== undefined) {
+    const ph = String(phone).replace(/[^\d+]/g, '');
+    if (!PHONE_REGEX.test(ph)) return res.status(400).json({ error: 'شماره موبایل معتبر وارد کنید (مثال: 0912xxxxxxx)' });
+    changes.phone = ph;
+  }
+  if (newPassword) {
+    if (!bcrypt.compareSync(currentPassword || '', req.user.passwordHash)) return res.status(400).json({ error: 'رمز عبور فعلی اشتباه است' });
+    if (newPassword.length < 4) return res.status(400).json({ error: 'رمز جدید حداقل ۴ کاراکتر باشد' });
+    if (newPassword !== confirmPassword) return res.status(400).json({ error: 'رمز جدید و تکرار آن یکسان نیستند' });
+    changes.passwordHash = bcrypt.hashSync(newPassword, 10);
+  }
+  const u = db.get('users').find({ id: req.user.id });
+  u.assign(changes).write();
+  if (changes.displayName) {
+    db.get('messages').filter({ userId: req.user.id }).forEach(m => { m.authorName = changes.displayName; }).value();
+    db.get('chatMessages').filter({ from: req.user.id }).forEach(m => { m.fromName = changes.displayName; }).value();
+    db.write();
+    const on = onlineUsers.get(req.user.id);
+    if (on) { on.displayName = changes.displayName; io.emit('presence', presenceList()); }
+  }
+  io.emit('userUpdated', publicUser(u.value()));
+  res.json({ user: { ...publicUser(u.value()), phone: u.value().phone || '' } });
+});
+
+app.get('/api/messages/:id', requireAuth, (req, res) => {
+  const m = db.get('messages').find({ id: req.params.id }).value();
+  if (!m) return res.status(404).json({ error: 'این پست پیدا نشد (شاید حذف شده باشد)' });
+  res.json({ message: m });
+});
+
+app.post('/api/attachments', requireAuth, requireRole('admin', 'member'), runUpload(attUpload, 'file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'فایلی انتخاب نشده' });
+  const [kind] = ATT_TYPES[baseMime(req.file.mimetype)];
+  const a = { id: uuid(), file: req.file.filename, kind, name: fixFileName(req.file.originalname), by: req.user.id, time: Date.now() };
+  db.get('attachments').push(a).write();
+  res.json({ attachment: { id: a.id, url: '/uploads/' + a.file, kind, name: a.name } });
 });
 
 // ---------- users / admin ----------
@@ -168,19 +267,65 @@ app.get('/api/topics', requireAuth, (req, res) => {
   res.json({ topics: db.get('topics').value() });
 });
 
+// who should hear about activity in a topic: admins + people who wrote in it
+function topicAudience(topicId, extraUserId) {
+  const ids = new Set(db.get('users').filter(u => u.role === 'admin').map('id').value());
+  db.get('messages').filter({ topicId }).forEach(m => ids.add(m.userId)).value();
+  if (extraUserId) ids.add(extraUserId);
+  return ids;
+}
+function notifyUsers(ids, exceptId, payload) {
+  ids.forEach(id => { if (id !== exceptId) io.to(`user:${id}`).emit('notify', payload); });
+}
+
 app.post('/api/topics', requireAuth, requireRole('admin'), (req, res) => {
-  const { title } = req.body || {};
+  const { title, description } = req.body || {};
   if (!title || !title.trim()) return res.status(400).json({ error: 'عنوان لازم است' });
-  const topic = { id: uuid(), title: title.trim(), pdfFile: null, pdfName: null, createdAt: Date.now() };
+  const topic = { id: uuid(), title: title.trim().slice(0, 100), description: (description || '').trim().slice(0, 200), pdfFile: null, pdfName: null, createdAt: Date.now() };
   db.get('topics').push(topic).write();
   io.emit('newTopic', topic);
   res.json({ topic });
 });
 
-app.post('/api/topics/:id/pdf', requireAuth, requireRole('admin'), upload.single('pdf'), (req, res) => {
+app.patch('/api/topics/:id', requireAuth, requireRole('admin'), (req, res) => {
   const topic = db.get('topics').find({ id: req.params.id });
   if (!topic.value()) return res.status(404).json({ error: 'تاپیک پیدا نشد' });
+  const { title, description } = req.body || {};
+  const changes = {};
+  if (title !== undefined) {
+    if (!String(title).trim()) return res.status(400).json({ error: 'عنوان نمی‌تواند خالی باشد' });
+    changes.title = String(title).trim().slice(0, 100);
+  }
+  if (description !== undefined) changes.description = String(description).trim().slice(0, 200);
+  topic.assign(changes).write();
+  io.emit('topicUpdated', topic.value());
+  notifyUsers(topicAudience(req.params.id), req.user.id, { kind: 'topic', topicId: req.params.id, topicTitle: topic.value().title, from: req.user.displayName, text: 'عنوان یا توضیح این تالار تغییر کرد' });
+  res.json({ topic: topic.value() });
+});
+
+function removeUploadedFile(name) {
+  if (!name || name !== path.basename(name)) return;
+  fs.unlink(path.join(uploadsDir, name), () => {});
+}
+
+app.post('/api/topics/:id/pdf', requireAuth, requireRole('admin'), runUpload(upload, 'pdf'), (req, res) => {
+  const topic = db.get('topics').find({ id: req.params.id });
+  if (!topic.value()) { if (req.file) removeUploadedFile(req.file.filename); return res.status(404).json({ error: 'تاپیک پیدا نشد' }); }
+  if (!req.file) return res.status(400).json({ error: 'فایلی انتخاب نشده' });
+  const old = topic.value().pdfFile;
   topic.assign({ pdfFile: req.file.filename, pdfName: fixFileName(req.file.originalname) }).write();
+  if (old) removeUploadedFile(old);
+  io.emit('topicUpdated', topic.value());
+  notifyUsers(topicAudience(req.params.id), req.user.id, { kind: 'topic', topicId: req.params.id, topicTitle: topic.value().title, from: req.user.displayName, text: 'فایل جدیدی بارگذاری شد' });
+  res.json({ topic: topic.value() });
+});
+
+app.delete('/api/topics/:id/pdf', requireAuth, requireRole('admin'), (req, res) => {
+  const topic = db.get('topics').find({ id: req.params.id });
+  if (!topic.value()) return res.status(404).json({ error: 'تاپیک پیدا نشد' });
+  const old = topic.value().pdfFile;
+  topic.assign({ pdfFile: null, pdfName: null }).write();
+  if (old) removeUploadedFile(old);
   io.emit('topicUpdated', topic.value());
   res.json({ topic: topic.value() });
 });
@@ -191,21 +336,35 @@ app.get('/api/topics/:id/messages', requireAuth, (req, res) => {
 });
 
 app.post('/api/topics/:id/messages', requireAuth, requireRole('admin', 'member'), (req, res) => {
-  const { text, replyTo } = req.body || {};
-  if (!text || !text.trim()) return res.status(400).json({ error: 'متن پیام خالی است' });
+  const topic = db.get('topics').find({ id: req.params.id }).value();
+  if (!topic) return res.status(404).json({ error: 'تاپیک پیدا نشد' });
+  const { text, replyTo, attachmentId } = req.body || {};
+  const attachment = takeAttachment(attachmentId, req.user);
+  const clean = (text || '').trim();
+  if (!clean && !attachment) return res.status(400).json({ error: 'متن پیام خالی است' });
+  if (clean.length > 4000) return res.status(400).json({ error: 'پیام خیلی طولانی است' });
+  const ref = replyTo ? db.get('messages').find({ id: replyTo, topicId: topic.id }).value() : null;
   const msg = {
     id: uuid(),
-    topicId: req.params.id,
+    topicId: topic.id,
     userId: req.user.id,
     authorName: req.user.displayName,
-    text: text.trim(),
+    text: clean,
+    attachment,
     time: Date.now(),
     likes: 0, dislikes: 0, thanks: 0,
     pinned: false,
-    replyTo: replyTo || null
+    replyTo: ref ? ref.id : null
   };
+  const audience = topicAudience(topic.id, ref && ref.userId);
   db.get('messages').push(msg).write();
   io.emit('newMessage', msg);
+  const snippet = clean ? clean.slice(0, 80) : (attachment ? (attachment.kind === 'image' ? '📷 عکس' : '🎤 پیام صوتی') : '');
+  audience.forEach(id => {
+    if (id === req.user.id) return;
+    const isReplyToMe = !!ref && ref.userId === id;
+    io.to(`user:${id}`).emit('notify', { kind: isReplyToMe ? 'reply' : 'message', topicId: topic.id, topicTitle: topic.title, from: req.user.displayName, text: snippet });
+  });
   res.json({ message: msg });
 });
 
@@ -344,9 +503,10 @@ app.post('/api/convs/:id/messages', requireAuth, requireRole('admin', 'member'),
   if (!c) return res.status(404).json({ error: 'گفتگو پیدا نشد' });
   if (!c.members.includes(req.user.id)) return res.status(403).json({ error: 'شما عضو این گفتگو نیستید' });
   const text = ((req.body || {}).text || '').trim();
-  if (!text) return res.status(400).json({ error: 'متن خالی است' });
+  const attachment = takeAttachment((req.body || {}).attachmentId, req.user);
+  if (!text && !attachment) return res.status(400).json({ error: 'متن خالی است' });
   if (text.length > 4000) return res.status(400).json({ error: 'پیام خیلی طولانی است' });
-  const msg = { id: uuid(), convId: c.id, from: req.user.id, fromName: req.user.displayName, text, time: Date.now() };
+  const msg = { id: uuid(), convId: c.id, from: req.user.id, fromName: req.user.displayName, text, attachment, time: Date.now() };
   db.get('chatMessages').push(msg).write();
   convRooms(c).emit('chatMessage', { msg, conv: { id: c.id, type: c.type, title: c.title, memberIds: c.members } });
   res.json({ message: msg });
@@ -376,6 +536,7 @@ app.post('/api/convs/:id/clear', requireAuth, (req, res) => {
 
 // ---------- socket.io: presence + private rooms ----------
 const onlineUsers = new Map(); // userId -> {displayName, lastSeen}
+function presenceList() { return Array.from(onlineUsers.entries()).map(([id, v]) => ({ id, ...v })); }
 
 io.on('connection', (socket) => {
   const sess = socket.request.session;

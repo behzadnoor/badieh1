@@ -93,3 +93,21 @@ header button.ghost:hover{background:rgba(255,255,255,.34)}
   header{padding:12px}
   header input[type=search]{order:5;max-width:none;flex-basis:100%}
 }
+
+/* ---- phase 3 additions ---- */
+.iconbtn{background:transparent;border:1px solid var(--line);color:var(--ink);border-radius:10px;padding:6px 10px;font-size:13px}
+.iconbtn:hover{border-color:var(--accent);color:var(--accent)}
+.iconbtn.on{background:var(--accent);color:var(--on-accent);border-color:var(--accent)}
+.composerRow{display:flex;flex-direction:column;gap:8px;margin-top:12px}
+.composerTools{display:flex;gap:6px;align-items:center}
+.attachPreview{display:flex;align-items:center;gap:8px;background:color-mix(in srgb,var(--accent) 10%,transparent);border:1px solid var(--line);border-radius:10px;padding:6px 10px;font-size:12px;margin-top:6px}
+.attachPreview img{height:40px;border-radius:6px}
+.attachPreview .rm{cursor:pointer;color:#c0392b;margin-right:auto}
+.msg .attach img{max-width:260px;max-height:260px;border-radius:10px;display:block;margin-top:6px;cursor:pointer}
+.msg .attach audio{margin-top:6px;max-width:260px}
+.topicHead{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.topicHead h2{margin:0}
+.topicHead .iconbtn{font-size:12px;padding:4px 8px}
+.msg.highlight{animation:hl 2.4s ease}
+@keyframes hl{0%{box-shadow:0 0 0 4px color-mix(in srgb,var(--accent) 55%,transparent)}100%{box-shadow:none}}
+.profileForm input{margin-bottom:10px}

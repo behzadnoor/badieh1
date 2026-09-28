@@ -7,6 +7,9 @@ let onlineMap = {};
 let socket = null;
 let convs = [], allConvs = [], currentConv = null, convReadOnly = false, convMsgs = [];
 const unread = {};
+let pendingAtt = null;       // {id, kind, name, url} staged for the topic composer
+let pendingChatAtt = null;   // same, for the chat composer
+let recognizer = null, recognizerTarget = null;
 
 const $ = (sel) => document.querySelector(sel);
 function esc(s){ const d=document.createElement('div'); d.textContent=s==null?'':s; return d.innerHTML; }
@@ -67,7 +70,7 @@ function startApp(user){
   $('#whoami').textContent = `${me.displayName} (${roleLabel(me.role)})`;
   if(me.role==='admin'){ $('#newTopicBtn').style.display='inline-block'; $('#adminBtn').style.display='inline-block'; }
   connectSocket();
-  loadTopics();
+  loadTopics().then(()=>jumpToMsgFromUrl());
   loadConvs();
 }
 function roleLabel(r){ return {admin:'مدیر', member:'عضو', pending:'در انتظار تایید', blocked:'مسدود'}[r] || r; }
@@ -81,7 +84,12 @@ function connectSocket(){
   socket.on('newMessage', m=>{ if(m.topicId===currentTopic){ messages.push(m); renderMain(); } });
   socket.on('messageUpdated', m=>{ const i=messages.findIndex(x=>x.id===m.id); if(i>-1){ messages[i]=m; if(m.topicId===currentTopic) renderMain(); } });
   socket.on('messageDeleted', ({id, topicId})=>{ messages = messages.filter(x=>x.id!==id); if(topicId===currentTopic) renderMain(); });
-  socket.on('userUpdated', u=>{ if(u.id===me.id){ me=u; $('#whoami').textContent = `${me.displayName} (${roleLabel(me.role)})`; renderMain(); } });
+  socket.on('userUpdated', u=>{
+    messages.forEach(m=>{ if(m.userId===u.id) m.authorName = u.displayName; });
+    convMsgs.forEach(m=>{ if(m.from===u.id) m.fromName = u.displayName; });
+    if(u.id===me.id){ me={...me, ...u}; $('#whoami').textContent = `${me.displayName} (${roleLabel(me.role)})`; }
+    if(currentTopic) renderMain(); else if(currentConv) renderChat();
+  });
   socket.on('chatMessage', ({msg, conv})=>{
     if(msg.convId===currentConv){ convMsgs.push(msg); renderChat(); window.scrollTo(0, document.body.scrollHeight); }
     else if(msg.from!==me.id && conv.memberIds.includes(me.id)){
@@ -92,6 +100,10 @@ function connectSocket(){
   });
   socket.on('chatMessageDeleted', ({id, convId})=>{ if(convId===currentConv){ convMsgs = convMsgs.filter(x=>x.id!==id); renderChat(); } loadConvs(); });
   socket.on('convChanged', ()=>loadConvs());
+  socket.on('notify', (n)=>{
+    const icon = n.kind==='reply' ? '↩️' : (n.kind==='topic' ? '📌' : '💬');
+    toast(`${icon} ${esc(n.from)} — ${esc(n.topicTitle||'')}${n.text?': '+esc(n.text):''}`);
+  });
 }
 
 // ---------------- topics ----------------
@@ -99,7 +111,7 @@ async function loadTopics(){
   const { topics: t } = await api('/api/topics');
   topics = t;
   renderTopics();
-  if(topics[0]) selectTopic(topics[0].id);
+  if(topics[0]) await selectTopic(topics[0].id);
 }
 function renderTopics(){
   $('#topicList').innerHTML = topics.map(t=>`<div class="topic ${t.id===currentTopic?'active':''}" data-id="${t.id}">${esc(t.title)}${t.pdfFile?' 📎':''}</div>`).join('') || '<p style="font-size:12px;color:var(--muted)">هنوز اتاقی نیست.</p>';
@@ -117,21 +129,18 @@ $('#newTopicBtn').onclick = async ()=>{
 };
 
 // ---------------- messages ----------------
-function renderMain(filter){
-  if(currentConv){ renderChat(); return; }
-  const t = topics.find(x=>x.id===currentTopic);
-  if(!t){ $('#mainArea').innerHTML='<div class="welcome"><h2>🌵 به راه بادیه مجازی خوش آمدید</h2><p>فضایی برای گفتگو، تبادل نظر و اشتراک‌گذاری دانش<br>در مسیر بی‌انتهای بیابان اندیشه</p><p>یک تالار را انتخاب کنید یا از فهرست اعضای آنلاین، گفتگوی خصوصی شروع کنید.</p></div>'; return; }
-  let list = filter ? messages.filter(m=>m.text.includes(filter)) : messages;
-  list = [...list].sort((a,b)=> (b.pinned?1:0)-(a.pinned?1:0) || a.time-b.time);
-  let html = `<h2>${esc(t.title)}</h2>`;
-  if(t.pdfFile) html += `<p><a href="/uploads/${t.pdfFile}" target="_blank">📎 ${esc(t.pdfName||'فایل PDF')}</a></p>`;
-  if(me.role==='admin') html += `<p><input type="file" id="pdfInput" accept="application/pdf" style="font-size:12px"></p>`;
-  html += list.map(m=>{
-    const ref = m.replyTo ? messages.find(x=>x.id===m.replyTo) : null;
-    return `<div class="msg ${m.pinned?'pinned':''}">
+function attachHtml(a){
+  if(!a) return '';
+  if(a.kind==='image') return `<div class="attach"><img src="${a.url}" onclick="window.open('${a.url}','_blank')" alt="${esc(a.name||'')}"></div>`;
+  return `<div class="attach"><audio controls src="${a.url}"></audio></div>`;
+}
+function msgRowHtml(m, ref, extraActions){
+  const canSpeak = !!(window.speechSynthesis && m.text);
+  return `<div class="msg ${m.pinned?'pinned':''}" id="m_${m.id}">
       <div class="meta">${avatar(m.authorName)}<b>${esc(m.authorName)}</b> ${m.pinned?'<span class="badge">پین‌شده</span>':''} <span>${fmtTime(m.time)}</span></div>
       ${ref?`<div class="reply-ref">در پاسخ به ${esc(ref.authorName)}: ${esc(ref.text.slice(0,60))}</div>`:''}
-      <div>${esc(m.text)}</div>
+      ${m.text?`<div>${esc(m.text)}</div>`:''}
+      ${attachHtml(m.attachment)}
       <div class="actions">
         <span onclick="react('${m.id}','likes')">👍 ${m.likes||0}</span>
         <span onclick="react('${m.id}','dislikes')">👎 ${m.dislikes||0}</span>
@@ -139,26 +148,58 @@ function renderMain(filter){
         ${canWrite()?`<span onclick="setReply('${m.id}')">پاسخ</span>`:''}
         ${(me.role==='admin'||m.userId===me.id)?`<span onclick="delMsg('${m.id}')">حذف</span>`:''}
         ${me.role==='admin'?`<span onclick="togglePin('${m.id}',${!m.pinned})">${m.pinned?'برداشتن پین':'پین کردن'}</span>`:''}
+        <span onclick="shareMsgLink('${m.id}')">🔗 لینک</span>
+        ${canSpeak?`<span onclick="speakText('${esc(m.text).replace(/'/g,"&#39;")}')">🔊 خواندن</span>`:''}
       </div>
     </div>`;
-  }).join('') || '<p style="color:var(--muted)">پیامی نیست.</p>';
+}
+function renderMain(filter){
+  if(currentConv){ renderChat(); return; }
+  const t = topics.find(x=>x.id===currentTopic);
+  if(!t){ $('#mainArea').innerHTML='<div class="welcome"><h2>🌵 به راه بادیه مجازی خوش آمدید</h2><p>فضایی برای گفتگو، تبادل نظر و اشتراک‌گذاری دانش<br>در مسیر بی‌انتهای بیابان اندیشه</p><p>یک تالار را انتخاب کنید یا از فهرست اعضای آنلاین، گفتگوی خصوصی شروع کنید.</p></div>'; return; }
+  let list = filter ? messages.filter(m=>m.text.includes(filter)) : messages;
+  list = [...list].sort((a,b)=> (b.pinned?1:0)-(a.pinned?1:0) || a.time-b.time);
+  let html = `<div class="topicHead"><h2>${esc(t.title)}</h2>${me.role==='admin'?`<button class="iconbtn" onclick="editTopic('${t.id}')">✏️ ویرایش تالار</button>`:''}</div>`;
+  if(t.description) html += `<p class="mutedNote">${esc(t.description)}</p>`;
+  if(t.pdfFile) html += `<p>📎 <a href="/uploads/${t.pdfFile}" target="_blank">${esc(t.pdfName||'فایل PDF')}</a>${me.role==='admin'?` <span class="iconbtn" style="cursor:pointer" onclick="deleteTopicPdf('${t.id}')">🗑 حذف فایل</span>`:''}</p>`;
+  if(me.role==='admin') html += `<p><label class="iconbtn" style="cursor:pointer">📎 ${t.pdfFile?'جایگزینی فایل PDF':'بارگذاری فایل PDF'}<input type="file" id="pdfInput" accept="application/pdf" style="display:none"></label></p>`;
+  html += `<div id="msgList">` + (list.map(m=>{
+    const ref = m.replyTo ? messages.find(x=>x.id===m.replyTo) : null;
+    return msgRowHtml(m, ref);
+  }).join('') || '<p style="color:var(--muted)">پیامی نیست.</p>') + `</div>`;
 
   if(canWrite()){
     html += `<div style="display:${replyTo?'block':'none'};font-size:12px;color:var(--muted)">در حال پاسخ <span onclick="clearReply()" style="cursor:pointer;color:var(--accent)">✕ لغو</span></div>
-    <div class="composer"><textarea id="composerInput" placeholder="پیام خود را بنویسید..."></textarea><button onclick="sendMsg()">ارسال</button></div>`;
+    <div class="composerRow">
+      <div class="composerTools">
+        <label class="iconbtn" style="cursor:pointer">📷🎤 پیوست<input type="file" id="msgAttachInput" accept="image/*,audio/*" style="display:none"></label>
+        <button type="button" class="iconbtn" id="micBtn" onclick="toggleMic('composerInput')" style="display:none">🎙️ گفتار به نوشتار</button>
+      </div>
+      <div class="composer"><textarea id="composerInput" placeholder="پیام خود را بنویسید..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMsg();}"></textarea><button onclick="sendMsg()">ارسال</button></div>
+      <div id="attachPreviewBox"></div>
+    </div>`;
   } else {
     html += `<div class="locked">${me.role==='pending' ? 'حساب شما هنوز توسط مدیر تایید نشده — فقط امکان مشاهده دارید.' : 'دسترسی نوشتن ندارید.'}</div>`;
   }
   $('#mainArea').innerHTML = html;
   const pdfInput = $('#pdfInput');
   if(pdfInput) pdfInput.onchange = uploadPdf;
+  const attInput = $('#msgAttachInput');
+  if(attInput) attInput.onchange = (e)=>stageAttachment(e, 'topic');
+  renderAttachPreview();
+  setupMicButton('micBtn','composerInput');
 }
 function setReply(id){ replyTo=id; renderMain(); }
 function clearReply(){ replyTo=null; renderMain(); }
 async function sendMsg(){
-  const el = $('#composerInput'); const val = el.value.trim(); if(!val) return;
-  await api(`/api/topics/${currentTopic}/messages`, { method:'POST', body:{ text: val, replyTo } });
-  replyTo=null; el.value='';
+  const el = $('#composerInput'); const val = el.value.trim();
+  if(!val && !pendingAtt) return;
+  const body = { text: val, replyTo };
+  if(pendingAtt) body.attachmentId = pendingAtt.id;
+  try{
+    await api(`/api/topics/${currentTopic}/messages`, { method:'POST', body });
+    replyTo=null; el.value=''; pendingAtt=null; renderAttachPreview();
+  }catch(e){ alert(e.message); }
 }
 async function react(id, kind){ await api(`/api/messages/${id}/react`, { method:'POST', body:{ kind } }); }
 async function togglePin(id, val){ await api(`/api/messages/${id}/pin`, { method:'POST', body:{ pinned: val } }); }
@@ -166,9 +207,138 @@ async function delMsg(id){ if(confirm('حذف شود؟')) await api(`/api/messag
 async function uploadPdf(e){
   const file = e.target.files[0]; if(!file) return;
   const fd = new FormData(); fd.append('pdf', file);
-  await fetch(`/api/topics/${currentTopic}/pdf`, { method:'POST', body: fd });
+  try{
+    const res = await fetch(`/api/topics/${currentTopic}/pdf`, { method:'POST', body: fd });
+    const data = await res.json().catch(()=>({}));
+    if(!res.ok) throw new Error(data.error||'خطا در بارگذاری فایل');
+  }catch(err){ alert(err.message); }
+}
+async function deleteTopicPdf(id){
+  if(!confirm('فایل PDF این تالار حذف شود؟')) return;
+  await api(`/api/topics/${id}/pdf`, { method:'DELETE' }).catch(e=>alert(e.message));
+}
+async function editTopic(id){
+  const t = topics.find(x=>x.id===id); if(!t) return;
+  openModal(`<h3>ویرایش تالار</h3>
+    <input id="editTopicTitle" value="${esc(t.title)}" placeholder="عنوان">
+    <textarea id="editTopicDesc" placeholder="توضیح کوتاه (اختیاری)" style="min-height:70px">${esc(t.description||'')}</textarea>
+    <div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end"><button class="ghost" onclick="closeModal()">انصراف</button><button onclick="saveTopicEdit('${id}')">ذخیره</button></div>`);
+}
+async function saveTopicEdit(id){
+  try{
+    await api(`/api/topics/${id}`, { method:'PATCH', body:{ title: $('#editTopicTitle').value, description: $('#editTopicDesc').value } });
+    closeModal();
+  }catch(e){ alert(e.message); }
 }
 $('#searchBox').oninput = e=> renderMain(e.target.value.trim());
+
+// ---------------- attachments (images / voice notes) ----------------
+async function stageAttachment(e, target){
+  const file = e.target.files[0]; if(!file) return;
+  const fd = new FormData(); fd.append('file', file);
+  try{
+    const res = await fetch('/api/attachments', { method:'POST', body: fd });
+    const data = await res.json().catch(()=>({}));
+    if(!res.ok) throw new Error(data.error||'خطا در بارگذاری فایل');
+    if(target==='topic'){ pendingAtt = data.attachment; renderAttachPreview(); }
+    else { pendingChatAtt = data.attachment; renderAttachPreview(); }
+  }catch(err){ alert(err.message); }
+  e.target.value = '';
+}
+function renderAttachPreview(){
+  const box = $('#attachPreviewBox');
+  if(box){
+    const a = pendingAtt;
+    box.innerHTML = a ? `<div class="attachPreview">${a.kind==='image'?`<img src="${a.url}">`:'🎤'} <span>${esc(a.name)}</span><span class="rm" onclick="pendingAtt=null;renderAttachPreview()">✕ حذف</span></div>` : '';
+  }
+  const cbox = $('#chatAttachPreviewBox');
+  if(cbox){
+    const a = pendingChatAtt;
+    cbox.innerHTML = a ? `<div class="attachPreview">${a.kind==='image'?`<img src="${a.url}">`:'🎤'} <span>${esc(a.name)}</span><span class="rm" onclick="pendingChatAtt=null;renderAttachPreview()">✕ حذف</span></div>` : '';
+  }
+}
+
+// ---------------- voice typing (speech-to-text) + text-to-speech ----------------
+function setupMicButton(btnId, targetId){
+  const btn = $('#'+btnId); if(!btn) return;
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if(!SR){ btn.style.display='none'; return; }
+  btn.style.display='inline-block';
+  btn.onclick = ()=>toggleMic(targetId, btnId);
+}
+function toggleMic(targetId, btnId){
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if(!SR) return;
+  const btn = btnId ? $('#'+btnId) : null;
+  if(recognizer && recognizerTarget===targetId){ recognizer.stop(); return; }
+  if(recognizer) recognizer.stop();
+  recognizer = new SR();
+  recognizer.lang = 'fa-IR';
+  recognizer.interimResults = false;
+  recognizerTarget = targetId;
+  if(btn) btn.classList.add('on');
+  recognizer.onresult = (ev)=>{
+    const text = Array.from(ev.results).map(r=>r[0].transcript).join(' ');
+    const el = $('#'+targetId); if(el) el.value = (el.value ? el.value+' ' : '') + text;
+  };
+  recognizer.onend = ()=>{ if(btn) btn.classList.remove('on'); recognizer=null; };
+  recognizer.onerror = ()=>{ if(btn) btn.classList.remove('on'); recognizer=null; };
+  recognizer.start();
+}
+function speakText(text){
+  if(!window.speechSynthesis || !text) return;
+  window.speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = 'fa-IR';
+  window.speechSynthesis.speak(u);
+}
+
+// ---------------- profile ----------------
+function openProfile(){
+  openModal(`<h3>پروفایل من</h3>
+    <div class="profileForm">
+      <input id="pfName" value="${esc(me.displayName)}" placeholder="نام نمایشی">
+      <input id="pfPhone" value="${esc(me.phone||'')}" placeholder="شماره موبایل">
+      <hr style="border-color:var(--line)">
+      <p class="mutedNote">برای تغییر رمز عبور (اختیاری):</p>
+      <input id="pfCurPass" type="password" placeholder="رمز عبور فعلی">
+      <input id="pfNewPass" type="password" placeholder="رمز عبور جدید">
+      <input id="pfNewPass2" type="password" placeholder="تکرار رمز عبور جدید">
+      <p class="err" id="pfErr"></p>
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end"><button class="ghost" onclick="closeModal()">انصراف</button><button onclick="saveProfile()">ذخیره</button></div>`);
+}
+async function saveProfile(){
+  const body = { displayName: $('#pfName').value, phone: $('#pfPhone').value };
+  const np = $('#pfNewPass').value;
+  if(np){ body.currentPassword = $('#pfCurPass').value; body.newPassword = np; body.confirmPassword = $('#pfNewPass2').value; }
+  try{
+    const { user } = await api('/api/me', { method:'PATCH', body });
+    me = { ...me, ...user };
+    $('#whoami').textContent = `${me.displayName} (${roleLabel(me.role)})`;
+    closeModal();
+  }catch(e){ $('#pfErr').textContent = e.message; }
+}
+
+// ---------------- cross-post links ----------------
+function shareMsgLink(id){
+  const url = `${location.origin}${location.pathname}?topic=${currentTopic}&msg=${id}`;
+  if(navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(url).then(()=>toast('🔗 لینک این پیام کپی شد')).catch(()=>toast(url));
+  else toast(url);
+}
+async function jumpToMsgFromUrl(){
+  const p = new URLSearchParams(location.search);
+  let topicId = p.get('topic'); const msgId = p.get('msg');
+  if(!msgId) return;
+  if(!topicId){
+    try{ const { message } = await api(`/api/messages/${msgId}`); topicId = message.topicId; }catch(e){ return; }
+  }
+  await selectTopic(topicId);
+  setTimeout(()=>{
+    const el = document.getElementById('m_'+msgId);
+    if(el){ if(el.scrollIntoView) el.scrollIntoView({behavior:'smooth', block:'center'}); el.classList.add('highlight'); setTimeout(()=>el.classList.remove('highlight'), 2500); }
+  }, 300);
+}
 
 // ---------------- online list ----------------
 function renderOnline(){
@@ -234,10 +404,15 @@ async function openConv(id, all){
 }
 function chatRowHtml(m){
   const mine = m.from===me.id;
+  const canSpeak = !!(window.speechSynthesis && m.text);
   return `<div class="msg ${mine?'mine':''}">
     <div class="meta">${avatar(m.fromName)}<b>${esc(m.fromName)}</b> <span>${fmtTime(m.time)}</span></div>
-    <div>${esc(m.text)}</div>
-    ${(mine && !convReadOnly)?`<div class="actions"><span onclick="delChatMsg('${m.id}')">حذف</span></div>`:''}
+    ${m.text?`<div>${esc(m.text)}</div>`:''}
+    ${attachHtml(m.attachment)}
+    <div class="actions">
+      ${(mine && !convReadOnly)?`<span onclick="delChatMsg('${m.id}')">حذف</span>`:''}
+      ${canSpeak?`<span onclick="speakText('${esc(m.text).replace(/'/g,"&#39;")}')">🔊 خواندن</span>`:''}
+    </div>
   </div>`;
 }
 function renderChat(){
@@ -250,18 +425,35 @@ function renderChat(){
   if(convReadOnly) html += `<p class="mutedNote">حالت نظارت مدیر اصلی — فقط خواندنی</p>`;
   html += `<div id="chatList">${convMsgs.map(chatRowHtml).join('') || '<p style="color:var(--muted)">هنوز پیامی نیست.</p>'}</div>`;
   if(!convReadOnly){
-    html += `<div class="composer"><textarea id="chatInput" placeholder="پیام خود را بنویسید... (Enter = ارسال)" onkeydown="chatKey(event)"></textarea><button onclick="sendChat()">ارسال</button></div>
+    html += `<div class="composerRow">
+      <div class="composerTools">
+        <label class="iconbtn" style="cursor:pointer">📷🎤 پیوست<input type="file" id="chatAttachInput" accept="image/*,audio/*" style="display:none"></label>
+        <button type="button" class="iconbtn" id="chatMicBtn" style="display:none">🎙️ گفتار به نوشتار</button>
+      </div>
+      <div class="composer"><textarea id="chatInput" placeholder="پیام خود را بنویسید... (Enter = ارسال)" onkeydown="chatKey(event)"></textarea><button onclick="sendChat()">ارسال</button></div>
+      <div id="chatAttachPreviewBox"></div>
+    </div>
       <p style="margin-top:12px"><button class="ghost" onclick="clearConv()">حذف این گفتگو از لیست من</button></p>`;
   }
   $('#mainArea').innerHTML = html;
   if($('#chatInput')) $('#chatInput').value = prev;
+  const attInput = $('#chatAttachInput');
+  if(attInput) attInput.onchange = (e)=>stageAttachment(e, 'chat');
+  renderAttachPreview();
+  setupMicButton('chatMicBtn','chatInput');
 }
 function chatKey(e){ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); sendChat(); } }
 async function sendChat(){
   const el = $('#chatInput'); if(!el) return;
-  const v = el.value.trim(); if(!v) return;
+  const v = el.value.trim();
+  if(!v && !pendingChatAtt) return;
+  const body = { text: v };
+  if(pendingChatAtt) body.attachmentId = pendingChatAtt.id;
   el.value = '';
-  try{ await api(`/api/convs/${currentConv}/messages`, { method:'POST', body:{ text: v } }); }
+  try{
+    await api(`/api/convs/${currentConv}/messages`, { method:'POST', body });
+    pendingChatAtt = null; renderAttachPreview();
+  }
   catch(e){ el.value = v; alert(e.message); }
 }
 async function delChatMsg(id){ if(confirm('این پیام برای همیشه حذف شود؟')) await api(`/api/chatmsg/${id}`, { method:'DELETE' }).catch(e=>alert(e.message)); }
