@@ -205,29 +205,45 @@ function appendDmMsg(m){
   list.scrollTop = list.scrollHeight;
 }
 
-// ---------------- theme (dark/light + accent color) ----------------
-const ACCENTS = ['#a8562f','#2f6ea8','#2f8a55','#8a2f8a','#c0392b','#b8860b'];
+// ---------------- theme (day/night + color palette) ----------------
+const PALETTES = [
+  {n:'پیش‌فرض', l:{bg:'#f7f6f3',card:'#ffffff',accent:'#a8562f'}, d:{bg:'#171512',card:'#221f1c',accent:'#d97a4d'}},
+  {n:'آبی',     l:{bg:'#eaf2fb',card:'#ffffff',accent:'#2f6ea8'}, d:{bg:'#0f1722',card:'#182231',accent:'#5aa0e0'}},
+  {n:'سبز',     l:{bg:'#eaf6ee',card:'#ffffff',accent:'#2f8a55'}, d:{bg:'#0f1a13',card:'#17251c',accent:'#5cc487'}},
+  {n:'بنفش',    l:{bg:'#f4ecfa',card:'#ffffff',accent:'#8a2f8a'}, d:{bg:'#1a1220',card:'#251a2d',accent:'#c76fc7'}},
+  {n:'کرم',     l:{bg:'#fbf1dc',card:'#fffdf8',accent:'#b8860b'}, d:{bg:'#1c1710',card:'#292216',accent:'#e0b04a'}},
+  {n:'خاکستری', l:{bg:'#ececec',card:'#ffffff',accent:'#444444'}, d:{bg:'#111111',card:'#1c1c1c',accent:'#bbbbbb'}}
+];
+function currentMode(){
+  const m = localStorage.getItem('themeMode');
+  if(m==='light' || m==='dark') return m;
+  return (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+}
 function applyTheme(){
-  const mode = localStorage.getItem('themeMode') || 'system';
-  if(mode==='system') document.documentElement.removeAttribute('data-theme');
-  else document.documentElement.setAttribute('data-theme', mode);
-  const accent = localStorage.getItem('themeAccent');
-  if(accent) document.documentElement.style.setProperty('--accent', accent);
+  const mode = currentMode();
+  const pal = PALETTES[parseInt(localStorage.getItem('themePalette')||'0',10)] || PALETTES[0];
+  const c = mode==='dark' ? pal.d : pal.l;
+  const root = document.documentElement;
+  root.setAttribute('data-theme', mode);
+  root.style.setProperty('--bg', c.bg);
+  root.style.setProperty('--card', c.card);
+  root.style.setProperty('--accent', c.accent);
   const btn = $('#themeToggleBtn');
-  if(btn) btn.textContent = mode==='dark' ? '☀️' : (mode==='light' ? '🌙' : '🌓');
+  if(btn) btn.textContent = mode==='dark' ? '☀️ حالت روز' : '🌙 حالت شب';
 }
 applyTheme();
 $('#themeToggleBtn').onclick = ()=>{
-  const cur = localStorage.getItem('themeMode') || 'system';
-  const next = cur==='light' ? 'dark' : (cur==='dark' ? 'system' : 'light');
-  localStorage.setItem('themeMode', next);
+  localStorage.setItem('themeMode', currentMode()==='dark' ? 'light' : 'dark');
   applyTheme();
 };
 $('#themeColorBtn').onclick = ()=>{
-  openModal(`<h3>رنگ زمینه</h3>
-    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px">
-      ${ACCENTS.map(c=>`<div onclick="setAccent('${c}')" style="width:32px;height:32px;border-radius:50%;background:${c};cursor:pointer;border:2px solid var(--line)"></div>`).join('')}
+  const mode = currentMode();
+  const sel = parseInt(localStorage.getItem('themePalette')||'0',10);
+  openModal(`<h3>رنگ و پس‌زمینه</h3>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:12px">
+      ${PALETTES.map((p,i)=>{ const c = mode==='dark'?p.d:p.l; return `<div onclick="setPalette(${i})" style="cursor:pointer;text-align:center;font-size:12px">
+        <div style="height:44px;border-radius:10px;background:${c.bg};border:3px solid ${i===sel?c.accent:'var(--line)'};display:flex;align-items:center;justify-content:center"><span style="width:18px;height:18px;border-radius:50%;background:${c.accent}"></span></div>${p.n}</div>`; }).join('')}
     </div>
     <div style="text-align:left"><button class="ghost" onclick="closeModal()">بستن</button></div>`);
 };
-function setAccent(c){ localStorage.setItem('themeAccent', c); applyTheme(); closeModal(); }
+function setPalette(i){ localStorage.setItem('themePalette', String(i)); applyTheme(); closeModal(); }
