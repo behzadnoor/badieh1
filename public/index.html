@@ -39,7 +39,7 @@
     <h1>🗣️ راه بادیه مجازی</h1>
     <input id="searchBox" type="search" placeholder="جستجو در پیام‌ها...">
     <span id="whoami"></span>
-    <button class="ghost" id="dmBtn">پیام خصوصی</button>
+    <button class="ghost" id="dmBtn">گفتگوی جدید</button>
     <button class="ghost" id="themeColorBtn">🎨 رنگ</button>
     <button class="ghost" id="themeToggleBtn">🌓</button>
     <button class="ghost" id="adminBtn" style="display:none">مدیریت</button>
@@ -49,9 +49,16 @@
     <div class="side">
       <h3>آنلاین</h3>
       <div id="onlineList"></div>
+      <h3>گفتگوهای خصوصی</h3>
+      <div id="convList"></div>
+      <button class="ghost" id="newConvBtn">+ گفتگوی جدید</button>
       <h3>اتاق‌ها</h3>
       <div id="topicList"></div>
       <button class="ghost" id="newTopicBtn" style="display:none">+ تاپیک جدید</button>
+      <div id="allConvsBox" style="display:none">
+        <h3>همه‌ی گفتگوها (فقط مدیر اصلی)</h3>
+        <div id="allConvList"></div>
+      </div>
     </div>
     <div class="main" id="mainArea"></div>
   </div>

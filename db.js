@@ -10,6 +10,6 @@ const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || __dirname;
 const adapter = new FileSync(path.join(DATA_DIR, 'db.json'));
 const db = low(adapter);
 
-db.defaults({ users: [], topics: [], messages: [], dms: [] }).write();
+db.defaults({ users: [], topics: [], messages: [], dms: [], conversations: [], chatMessages: [] }).write();
 
 module.exports = db;

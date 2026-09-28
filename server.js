@@ -61,10 +61,29 @@ function requireRole(...roles) {
 }
 function publicUser(u) {
   if (!u) return null;
-  return { id: u.id, username: u.username, displayName: u.displayName, role: u.role };
+  const first = db.get('users').first().value();
+  return { id: u.id, username: u.username, displayName: u.displayName, role: u.role, isOwner: !!first && first.id === u.id };
+}
+// the "main admin" is the first person who ever registered
+function isOwnerUser(u) {
+  const first = db.get('users').first().value();
+  return !!u && !!first && first.id === u.id;
 }
 
 // ---------- auth ----------
+// multer/busboy read non-ASCII filenames as latin1, which garbles Persian names
+// (mojibake like "Ù\u0081Ø..."). Re-decode as UTF-8 when the text is clearly
+// mis-decoded; leave already-correct names (or plain ASCII) untouched.
+function fixFileName(name) {
+  if (!name) return name;
+  if (/[^\u0000-\u00ff]/.test(name)) return name;      // already real Unicode
+  const decoded = Buffer.from(name, 'latin1').toString('utf8');
+  return decoded.includes('\ufffd') ? name : decoded;
+}
+// repair names that were already saved garbled before this fix
+db.get('topics').forEach(t => { if (t.pdfName) t.pdfName = fixFileName(t.pdfName); }).value();
+db.write();
+
 const PHONE_REGEX = /^(0|\+98|0098)?9\d{9}$/;
 
 app.post('/api/auth/register', (req, res) => {
@@ -161,10 +180,7 @@ app.post('/api/topics', requireAuth, requireRole('admin'), (req, res) => {
 app.post('/api/topics/:id/pdf', requireAuth, requireRole('admin'), upload.single('pdf'), (req, res) => {
   const topic = db.get('topics').find({ id: req.params.id });
   if (!topic.value()) return res.status(404).json({ error: 'تاپیک پیدا نشد' });
-  // multer/busboy decode non-ASCII original filenames as latin1 by default,
-  // which garbles Persian/UTF-8 names — re-decode them correctly here.
-  const fixedName = Buffer.from(req.file.originalname, 'latin1').toString('utf8');
-  topic.assign({ pdfFile: req.file.filename, pdfName: fixedName }).write();
+  topic.assign({ pdfFile: req.file.filename, pdfName: fixFileName(req.file.originalname) }).write();
   io.emit('topicUpdated', topic.value());
   res.json({ topic: topic.value() });
 });
@@ -232,29 +248,130 @@ app.get('/api/search', requireAuth, (req, res) => {
   res.json({ results });
 });
 
-// ---------- direct messages ----------
-function dmKey(a, b) { return [a, b].sort().join('_'); }
+// ---------- private conversations (1:1 and group) ----------
+// conversations: { id, type:'dm'|'group', title, members:[userId], createdBy, createdAt, clearedAt:{userId:ts} }
+// chatMessages : { id, convId, from, fromName, text, time }
+// Everything is stored permanently. A user can "clear" a conversation for
+// themselves (they stop seeing older messages) or delete their own messages.
+// Only the main admin (first registered user) can read all conversations.
 
-app.get('/api/dms/:userId', requireAuth, (req, res) => {
-  const key = dmKey(req.user.id, req.params.userId);
-  res.json({ messages: db.get('dms').filter({ key }).value() });
+// one-time migration of the old 1:1 "dms" collection into conversations
+(function migrateLegacyDms() {
+  const legacy = db.get('dms').value() || [];
+  if (!legacy.length) return;
+  const byKey = {};
+  legacy.forEach(m => { (byKey[m.key] = byKey[m.key] || []).push(m); });
+  Object.values(byKey).forEach(list => {
+    const first = list[0];
+    const conv = { id: uuid(), type: 'dm', title: '', members: [first.from, first.to], createdBy: first.from, createdAt: first.time || Date.now(), clearedAt: {} };
+    db.get('conversations').push(conv).write();
+    list.forEach(m => db.get('chatMessages').push({ id: m.id || uuid(), convId: conv.id, from: m.from, fromName: m.fromName, text: m.text, time: m.time }).write());
+  });
+  db.set('dms', []).write();
+})();
+
+function userById(id) { return db.get('users').find({ id }).value(); }
+
+function convView(c, viewerId) {
+  const cleared = viewerId ? ((c.clearedAt || {})[viewerId] || 0) : 0;
+  const msgs = db.get('chatMessages').filter(m => m.convId === c.id && m.time > cleared).value();
+  const last = msgs.length ? msgs[msgs.length - 1] : null;
+  return {
+    id: c.id, type: c.type, title: c.title,
+    members: c.members.map(id => publicUser(userById(id))).filter(Boolean),
+    lastTime: last ? last.time : 0,
+    createdAt: c.createdAt,
+    visible: !cleared || !!last   // a cleared chat reappears only when a newer message arrives
+  };
+}
+function convRooms(c) {
+  let target = io;
+  c.members.forEach(id => { target = target.to(`user:${id}`); });
+  return target.to('owner');
+}
+
+// conversations I am a member of
+app.get('/api/convs', requireAuth, (req, res) => {
+  const list = db.get('conversations').filter(c => c.members.includes(req.user.id)).value()
+    .map(c => convView(c, req.user.id)).filter(v => v.visible)
+    .sort((a, b) => (b.lastTime || b.createdAt) - (a.lastTime || a.createdAt));
+  res.json({ conversations: list });
 });
 
-app.post('/api/dms/:userId', requireAuth, (req, res) => {
-  const { text } = req.body || {};
-  if (!text || !text.trim()) return res.status(400).json({ error: 'متن خالی است' });
-  const other = db.get('users').find({ id: req.params.userId }).value();
-  if (!other) return res.status(404).json({ error: 'کاربر پیدا نشد' });
-  const msg = {
-    id: uuid(),
-    key: dmKey(req.user.id, req.params.userId),
-    from: req.user.id, fromName: req.user.displayName,
-    to: req.params.userId,
-    text: text.trim(), time: Date.now()
+// ALL conversations — main admin only
+app.get('/api/convs/all', requireAuth, (req, res) => {
+  if (!isOwnerUser(req.user)) return res.status(403).json({ error: 'دسترسی غیرمجاز' });
+  const list = db.get('conversations').value().map(c => convView(c, null))
+    .sort((a, b) => (b.lastTime || b.createdAt) - (a.lastTime || a.createdAt));
+  res.json({ conversations: list });
+});
+
+// start a 1:1 chat (one person) or a group (several people)
+app.post('/api/convs', requireAuth, requireRole('admin', 'member'), (req, res) => {
+  const { memberIds, title } = req.body || {};
+  const ids = Array.from(new Set((Array.isArray(memberIds) ? memberIds : []).filter(id => id !== req.user.id)))
+    .filter(id => { const u = userById(id); return u && ['admin', 'member'].includes(u.role); });
+  if (!ids.length) return res.status(400).json({ error: 'حداقل یک عضو معتبر انتخاب کنید' });
+  if (ids.length > 19) return res.status(400).json({ error: 'حداکثر ۲۰ نفر در یک گروه' });
+  const members = [req.user.id, ...ids];
+  if (members.length === 2) {
+    const existing = db.get('conversations').find(c => c.type === 'dm' && c.members.length === 2 && c.members.every(m => members.includes(m))).value();
+    if (existing) return res.json({ conversation: convView(existing, req.user.id) });
+  }
+  const names = members.map(id => (userById(id) || {}).displayName).filter(Boolean);
+  const conv = {
+    id: uuid(), type: members.length === 2 ? 'dm' : 'group',
+    title: members.length === 2 ? '' : ((title || '').trim().slice(0, 60) || names.join('، ').slice(0, 60)),
+    members, createdBy: req.user.id, createdAt: Date.now(), clearedAt: {}
   };
-  db.get('dms').push(msg).write();
-  io.to(`user:${req.params.userId}`).to(`user:${req.user.id}`).emit('newDM', msg);
+  db.get('conversations').push(conv).write();
+  convRooms(conv).emit('convChanged', { id: conv.id });
+  res.json({ conversation: convView(conv, req.user.id) });
+});
+
+app.get('/api/convs/:id/messages', requireAuth, (req, res) => {
+  const c = db.get('conversations').find({ id: req.params.id }).value();
+  if (!c) return res.status(404).json({ error: 'گفتگو پیدا نشد' });
+  const isMember = c.members.includes(req.user.id);
+  const ownerView = isOwnerUser(req.user) && req.query.all === '1';
+  if (!isMember && !isOwnerUser(req.user)) return res.status(403).json({ error: 'دسترسی غیرمجاز' });
+  const cleared = (isMember && !ownerView) ? ((c.clearedAt || {})[req.user.id] || 0) : 0;
+  res.json({ messages: db.get('chatMessages').filter(m => m.convId === c.id && m.time > cleared).value() });
+});
+
+app.post('/api/convs/:id/messages', requireAuth, requireRole('admin', 'member'), (req, res) => {
+  const c = db.get('conversations').find({ id: req.params.id }).value();
+  if (!c) return res.status(404).json({ error: 'گفتگو پیدا نشد' });
+  if (!c.members.includes(req.user.id)) return res.status(403).json({ error: 'شما عضو این گفتگو نیستید' });
+  const text = ((req.body || {}).text || '').trim();
+  if (!text) return res.status(400).json({ error: 'متن خالی است' });
+  if (text.length > 4000) return res.status(400).json({ error: 'پیام خیلی طولانی است' });
+  const msg = { id: uuid(), convId: c.id, from: req.user.id, fromName: req.user.displayName, text, time: Date.now() };
+  db.get('chatMessages').push(msg).write();
+  convRooms(c).emit('chatMessage', { msg, conv: { id: c.id, type: c.type, title: c.title, memberIds: c.members } });
   res.json({ message: msg });
+});
+
+// delete one of MY OWN messages (permanent)
+app.delete('/api/chatmsg/:id', requireAuth, (req, res) => {
+  const m = db.get('chatMessages').find({ id: req.params.id }).value();
+  if (!m) return res.status(404).json({ error: 'پیام پیدا نشد' });
+  if (m.from !== req.user.id) return res.status(403).json({ error: 'فقط پیام‌های خودتان را می‌توانید حذف کنید' });
+  db.get('chatMessages').remove({ id: m.id }).write();
+  const c = db.get('conversations').find({ id: m.convId }).value();
+  if (c) convRooms(c).emit('chatMessageDeleted', { id: m.id, convId: m.convId });
+  res.json({ ok: true });
+});
+
+// "delete chat for me": hides older messages from my view only
+app.post('/api/convs/:id/clear', requireAuth, (req, res) => {
+  const c = db.get('conversations').find({ id: req.params.id });
+  if (!c.value()) return res.status(404).json({ error: 'گفتگو پیدا نشد' });
+  if (!c.value().members.includes(req.user.id)) return res.status(403).json({ error: 'دسترسی غیرمجاز' });
+  const clearedAt = { ...(c.value().clearedAt || {}), [req.user.id]: Date.now() };
+  c.assign({ clearedAt }).write();
+  io.to(`user:${req.user.id}`).emit('convChanged', { id: req.params.id });
+  res.json({ ok: true });
 });
 
 // ---------- socket.io: presence + private rooms ----------
@@ -268,6 +385,7 @@ io.on('connection', (socket) => {
   if (!user) { socket.disconnect(); return; }
 
   socket.join(`user:${userId}`);
+  if (isOwnerUser(user)) socket.join('owner');
   onlineUsers.set(userId, { displayName: user.displayName, lastSeen: Date.now() });
   io.emit('presence', Array.from(onlineUsers.entries()).map(([id, v]) => ({ id, ...v })));
 

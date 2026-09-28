@@ -5,6 +5,8 @@ let messages = [];
 let replyTo = null;
 let onlineMap = {};
 let socket = null;
+let convs = [], allConvs = [], currentConv = null, convReadOnly = false, convMsgs = [];
+const unread = {};
 
 const $ = (sel) => document.querySelector(sel);
 function esc(s){ const d=document.createElement('div'); d.textContent=s==null?'':s; return d.innerHTML; }
@@ -62,6 +64,7 @@ function startApp(user){
   if(me.role==='admin'){ $('#newTopicBtn').style.display='inline-block'; $('#adminBtn').style.display='inline-block'; }
   connectSocket();
   loadTopics();
+  loadConvs();
 }
 function roleLabel(r){ return {admin:'مدیر', member:'عضو', pending:'در انتظار تایید', blocked:'مسدود'}[r] || r; }
 function canWrite(){ return me && (me.role==='admin' || me.role==='member'); }
@@ -75,7 +78,16 @@ function connectSocket(){
   socket.on('messageUpdated', m=>{ const i=messages.findIndex(x=>x.id===m.id); if(i>-1){ messages[i]=m; if(m.topicId===currentTopic) renderMain(); } });
   socket.on('messageDeleted', ({id, topicId})=>{ messages = messages.filter(x=>x.id!==id); if(topicId===currentTopic) renderMain(); });
   socket.on('userUpdated', u=>{ if(u.id===me.id){ me=u; $('#whoami').textContent = `${me.displayName} (${roleLabel(me.role)})`; renderMain(); } });
-  socket.on('newDM', m=>{ if(window.__dmWith && (m.from===window.__dmWith || m.to===window.__dmWith)) appendDmMsg(m); });
+  socket.on('chatMessage', ({msg, conv})=>{
+    if(msg.convId===currentConv){ convMsgs.push(msg); renderChat(); window.scrollTo(0, document.body.scrollHeight); }
+    else if(msg.from!==me.id && conv.memberIds.includes(me.id)){
+      unread[msg.convId] = (unread[msg.convId]||0) + 1;
+      toast(`💬 پیام جدید از ${msg.fromName}`);
+    }
+    loadConvs();
+  });
+  socket.on('chatMessageDeleted', ({id, convId})=>{ if(convId===currentConv){ convMsgs = convMsgs.filter(x=>x.id!==id); renderChat(); } loadConvs(); });
+  socket.on('convChanged', ()=>loadConvs());
 }
 
 // ---------------- topics ----------------
@@ -90,7 +102,7 @@ function renderTopics(){
   document.querySelectorAll('.topic').forEach(el=>el.onclick=()=>selectTopic(el.dataset.id));
 }
 async function selectTopic(id){
-  currentTopic = id; renderTopics(); replyTo=null;
+  currentTopic = id; currentConv = null; convReadOnly = false; renderTopics(); renderConvLists(); replyTo=null;
   const { messages: m } = await api(`/api/topics/${id}/messages`);
   messages = m; renderMain();
 }
@@ -102,6 +114,7 @@ $('#newTopicBtn').onclick = async ()=>{
 
 // ---------------- messages ----------------
 function renderMain(filter){
+  if(currentConv){ renderChat(); return; }
   const t = topics.find(x=>x.id===currentTopic);
   if(!t){ $('#mainArea').innerHTML=''; return; }
   let list = filter ? messages.filter(m=>m.text.includes(filter)) : messages;
@@ -155,7 +168,10 @@ $('#searchBox').oninput = e=> renderMain(e.target.value.trim());
 
 // ---------------- online list ----------------
 function renderOnline(){
-  const items = Object.entries(onlineMap).map(([id,u])=>`<div><span class="dot ${u.offline?'off':''}"></span>${esc(u.displayName)}${u.offline?` — آخرین بازدید ${fmtTime(u.lastSeen)}`:''}</div>`);
+  const items = Object.entries(onlineMap).map(([id,u])=>{
+    const click = (me && id!==me.id) ? ` onclick="startDm('${id}')" style="cursor:pointer" title="شروع گفتگوی خصوصی"` : '';
+    return `<div${click}><span class="dot ${u.offline?'off':''}"></span>${esc(u.displayName)}${u.offline?` — آخرین بازدید ${fmtTime(u.lastSeen)}`:''}</div>`;
+  });
   $('#onlineList').innerHTML = items.join('') || '<div style="font-size:12px;color:var(--muted)">کسی آنلاین نیست</div>';
 }
 
@@ -176,34 +192,110 @@ $('#adminBtn').onclick = async ()=>{
 };
 async function setRole(id, role){ await api(`/api/users/${id}/role`, { method:'POST', body:{ role } }); $('#adminBtn').click(); }
 
-// ---------------- direct messages ----------------
-$('#dmBtn').onclick = async ()=>{
+// ---------------- private conversations (inline in the main area) ----------------
+function toast(t){
+  let el = $('#toast'); if(!el){ el = document.createElement('div'); el.id='toast'; document.body.appendChild(el); }
+  el.textContent = t; el.style.opacity = '1';
+  clearTimeout(toast._t); toast._t = setTimeout(()=>{ el.style.opacity='0'; }, 4000);
+}
+function convName(c){
+  if(c.type==='dm'){ const o = c.members.find(m=>m.id!==me.id) || c.members[0]; return o ? o.displayName : 'گفتگو'; }
+  return c.title || 'گروه';
+}
+async function loadConvs(){
+  try{ convs = (await api('/api/convs')).conversations; }catch(e){ convs = []; }
+  if(me && me.isOwner){ try{ allConvs = (await api('/api/convs/all')).conversations; }catch(e){ allConvs = []; } }
+  renderConvLists();
+}
+function convItemHtml(c, all){
+  const n = unread[c.id] || 0;
+  const label = all ? c.members.map(m=>esc(m.displayName)).join(' ↔ ') : esc(convName(c));
+  const active = currentConv===c.id && convReadOnly===!!all;
+  return `<div class="topic ${active?'active':''}" onclick="openConv('${c.id}',${all?'true':'false'})">${c.type==='group'?'👥 ':'💬 '}${label}${n?` <span class="badge">${n}</span>`:''}</div>`;
+}
+function renderConvLists(){
+  const el = $('#convList'); if(!el) return;
+  el.innerHTML = convs.map(c=>convItemHtml(c,false)).join('') || '<p class="mutedNote">هنوز گفتگویی ندارید.</p>';
+  const box = $('#allConvsBox');
+  if(me && me.isOwner){
+    box.style.display = 'block';
+    $('#allConvList').innerHTML = allConvs.map(c=>convItemHtml(c,true)).join('') || '<p class="mutedNote">گفتگویی نیست.</p>';
+  } else box.style.display = 'none';
+}
+async function openConv(id, all){
+  currentConv = id; convReadOnly = !!all; currentTopic = null; replyTo = null; unread[id] = 0;
+  renderTopics(); renderConvLists();
+  try{ convMsgs = (await api(`/api/convs/${id}/messages${all?'?all=1':''}`)).messages; }catch(e){ alert(e.message); return; }
+  renderChat(); window.scrollTo(0, document.body.scrollHeight);
+}
+function chatRowHtml(m){
+  const mine = m.from===me.id;
+  return `<div class="msg ${mine?'mine':''}">
+    <div class="meta"><b>${esc(m.fromName)}</b> <span>${fmtTime(m.time)}</span></div>
+    <div>${esc(m.text)}</div>
+    ${(mine && !convReadOnly)?`<div class="actions"><span onclick="delChatMsg('${m.id}')">حذف</span></div>`:''}
+  </div>`;
+}
+function renderChat(){
+  const c = (convReadOnly ? allConvs : convs).find(x=>x.id===currentConv);
+  if(!c){ $('#mainArea').innerHTML = ''; return; }
+  const prev = $('#chatInput') ? $('#chatInput').value : '';
+  const names = c.members.map(m=>esc(m.displayName)).join('، ');
+  let html = `<h2>${c.type==='group'?'👥':'💬'} ${convReadOnly ? names : esc(convName(c))}</h2>`;
+  if(c.type==='group') html += `<p class="mutedNote">اعضا: ${names}</p>`;
+  html += `<p class="mutedNote">🔒 مدیر اصلی سایت به همه‌ی گفتگوهای خصوصی دسترسی دارد.</p>`;
+  if(convReadOnly) html += `<p class="mutedNote">حالت نظارت مدیر اصلی — فقط خواندنی</p>`;
+  html += `<div id="chatList">${convMsgs.map(chatRowHtml).join('') || '<p style="color:var(--muted)">هنوز پیامی نیست.</p>'}</div>`;
+  if(!convReadOnly){
+    html += `<div class="composer"><textarea id="chatInput" placeholder="پیام خود را بنویسید... (Enter = ارسال)" onkeydown="chatKey(event)"></textarea><button onclick="sendChat()">ارسال</button></div>
+      <p style="margin-top:12px"><button class="ghost" onclick="clearConv()">حذف این گفتگو از لیست من</button></p>`;
+  }
+  $('#mainArea').innerHTML = html;
+  if($('#chatInput')) $('#chatInput').value = prev;
+}
+function chatKey(e){ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); sendChat(); } }
+async function sendChat(){
+  const el = $('#chatInput'); if(!el) return;
+  const v = el.value.trim(); if(!v) return;
+  el.value = '';
+  try{ await api(`/api/convs/${currentConv}/messages`, { method:'POST', body:{ text: v } }); }
+  catch(e){ el.value = v; alert(e.message); }
+}
+async function delChatMsg(id){ if(confirm('این پیام برای همیشه حذف شود؟')) await api(`/api/chatmsg/${id}`, { method:'DELETE' }).catch(e=>alert(e.message)); }
+async function clearConv(){
+  if(!confirm('این گفتگو از لیست شما پاک شود؟ پیام‌های قبلی دیگر برای شما نمایش داده نمی‌شوند (برای مدیر اصلی سایت همچنان قابل مشاهده‌اند).')) return;
+  await api(`/api/convs/${currentConv}/clear`, { method:'POST' }).catch(e=>alert(e.message));
+  currentConv = null; await loadConvs();
+  if(topics[0]) selectTopic(topics[0].id); else $('#mainArea').innerHTML = '';
+}
+async function openNewConv(){
+  if(!canWrite()){ alert('برای شروع گفتگو باید حساب شما توسط مدیر تایید شود.'); return; }
   const { users } = await api('/api/members').catch(()=>({users:[]}));
-  const list = users.filter(u=>u.id!==me.id).map(u=>({...u, online: !!(onlineMap[u.id] && !onlineMap[u.id].offline)}));
-  openModal(`<h3>پیام خصوصی</h3>
-    <div>${list.map(u=>`<div class="userRow" style="cursor:pointer" onclick="openDm('${u.id}','${esc(u.displayName)}')"><span><span class="dot ${u.online?'':'off'}"></span> ${esc(u.displayName)}</span></div>`).join('') || '<p style="font-size:12px;color:var(--muted)">کاربر دیگری یافت نشد</p>'}</div>
-    <div style="margin-top:12px;text-align:left"><button class="ghost" onclick="closeModal()">بستن</button></div>`);
-};
-async function openDm(userId, name){
-  window.__dmWith = userId;
-  const { messages: dms } = await api(`/api/dms/${userId}`);
-  openModal(`<h3>گفتگو با ${esc(name)}</h3>
-    <div class="dmList" id="dmList">${dms.map(dmRowHtml).join('')}</div>
-    <div class="composer"><textarea id="dmInput" placeholder="پیام..."></textarea><button onclick="sendDm('${userId}')">ارسال</button></div>
-    <div style="margin-top:10px;text-align:left"><button class="ghost" onclick="closeModal()">بستن</button></div>`);
-  $('#dmList').scrollTop = $('#dmList').scrollHeight;
+  const list = users.filter(u=>u.id!==me.id);
+  openModal(`<h3>گفتگوی جدید</h3>
+    <p class="mutedNote">یک نفر انتخاب کنید = گفتگوی دونفره، چند نفر = گروه</p>
+    <div>${list.map(u=>`<label class="userRow" style="cursor:pointer"><span><span class="dot ${(onlineMap[u.id] && !onlineMap[u.id].offline)?'':'off'}"></span> ${esc(u.displayName)}</span><input type="checkbox" class="convPick" value="${u.id}" style="width:auto"></label>`).join('') || '<p class="mutedNote">کاربر دیگری یافت نشد</p>'}</div>
+    <input id="convTitle" placeholder="نام گروه (اختیاری)" style="margin-top:10px">
+    <div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end"><button class="ghost" onclick="closeModal()">بستن</button><button onclick="createConv()">شروع گفتگو</button></div>`);
 }
-function dmRowHtml(m){ return `<div class="dmMsg"><b>${esc(m.fromName||(m.from===me.id?me.displayName:''))}</b>: ${esc(m.text)} <span style="color:var(--muted);font-size:10px">${fmtTime(m.time)}</span></div>`; }
-async function sendDm(userId){
-  const el = $('#dmInput'); const val = el.value.trim(); if(!val) return;
-  await api(`/api/dms/${userId}`, { method:'POST', body:{ text: val } });
-  el.value='';
+async function createConv(){
+  const ids = [...document.querySelectorAll('.convPick:checked')].map(x=>x.value);
+  if(!ids.length){ alert('حداقل یک نفر را انتخاب کنید'); return; }
+  try{
+    const { conversation } = await api('/api/convs', { method:'POST', body:{ memberIds: ids, title: $('#convTitle').value } });
+    closeModal(); await loadConvs(); openConv(conversation.id, false);
+  }catch(e){ alert(e.message); }
 }
-function appendDmMsg(m){
-  const list = $('#dmList'); if(!list) return;
-  list.insertAdjacentHTML('beforeend', dmRowHtml(m));
-  list.scrollTop = list.scrollHeight;
+async function startDm(userId){
+  if(!me || userId===me.id) return;
+  if(!canWrite()){ alert('برای شروع گفتگو باید حساب شما توسط مدیر تایید شود.'); return; }
+  try{
+    const { conversation } = await api('/api/convs', { method:'POST', body:{ memberIds:[userId] } });
+    await loadConvs(); openConv(conversation.id, false);
+  }catch(e){ alert(e.message); }
 }
+$('#dmBtn').onclick = openNewConv;
+$('#newConvBtn').onclick = openNewConv;
 
 // ---------------- theme (day/night + color palette) ----------------
 const PALETTES = [
