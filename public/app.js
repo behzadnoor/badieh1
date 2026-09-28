@@ -10,6 +10,10 @@ const unread = {};
 
 const $ = (sel) => document.querySelector(sel);
 function esc(s){ const d=document.createElement('div'); d.textContent=s==null?'':s; return d.innerHTML; }
+function avatar(name){
+  const n=(name||'?').trim(); let h=0; for(const ch of n) h=(h*31+ch.codePointAt(0))%360;
+  return `<span class="avatar" style="background:hsl(${h},42%,42%)">${esc([...n][0]||'?')}</span>`;
+}
 function fmtTime(ts){ return new Date(ts).toLocaleTimeString('fa-IR',{hour:'2-digit',minute:'2-digit'}); }
 
 async function api(url, opts={}){
@@ -116,7 +120,7 @@ $('#newTopicBtn').onclick = async ()=>{
 function renderMain(filter){
   if(currentConv){ renderChat(); return; }
   const t = topics.find(x=>x.id===currentTopic);
-  if(!t){ $('#mainArea').innerHTML=''; return; }
+  if(!t){ $('#mainArea').innerHTML='<div class="welcome"><h2>🌵 به راه بادیه مجازی خوش آمدید</h2><p>فضایی برای گفتگو، تبادل نظر و اشتراک‌گذاری دانش<br>در مسیر بی‌انتهای بیابان اندیشه</p><p>یک تالار را انتخاب کنید یا از فهرست اعضای آنلاین، گفتگوی خصوصی شروع کنید.</p></div>'; return; }
   let list = filter ? messages.filter(m=>m.text.includes(filter)) : messages;
   list = [...list].sort((a,b)=> (b.pinned?1:0)-(a.pinned?1:0) || a.time-b.time);
   let html = `<h2>${esc(t.title)}</h2>`;
@@ -125,7 +129,7 @@ function renderMain(filter){
   html += list.map(m=>{
     const ref = m.replyTo ? messages.find(x=>x.id===m.replyTo) : null;
     return `<div class="msg ${m.pinned?'pinned':''}">
-      <div class="meta"><b>${esc(m.authorName)}</b> ${m.pinned?'<span class="badge">پین‌شده</span>':''} <span>${fmtTime(m.time)}</span></div>
+      <div class="meta">${avatar(m.authorName)}<b>${esc(m.authorName)}</b> ${m.pinned?'<span class="badge">پین‌شده</span>':''} <span>${fmtTime(m.time)}</span></div>
       ${ref?`<div class="reply-ref">در پاسخ به ${esc(ref.authorName)}: ${esc(ref.text.slice(0,60))}</div>`:''}
       <div>${esc(m.text)}</div>
       <div class="actions">
@@ -231,7 +235,7 @@ async function openConv(id, all){
 function chatRowHtml(m){
   const mine = m.from===me.id;
   return `<div class="msg ${mine?'mine':''}">
-    <div class="meta"><b>${esc(m.fromName)}</b> <span>${fmtTime(m.time)}</span></div>
+    <div class="meta">${avatar(m.fromName)}<b>${esc(m.fromName)}</b> <span>${fmtTime(m.time)}</span></div>
     <div>${esc(m.text)}</div>
     ${(mine && !convReadOnly)?`<div class="actions"><span onclick="delChatMsg('${m.id}')">حذف</span></div>`:''}
   </div>`;
@@ -243,7 +247,6 @@ function renderChat(){
   const names = c.members.map(m=>esc(m.displayName)).join('، ');
   let html = `<h2>${c.type==='group'?'👥':'💬'} ${convReadOnly ? names : esc(convName(c))}</h2>`;
   if(c.type==='group') html += `<p class="mutedNote">اعضا: ${names}</p>`;
-  html += `<p class="mutedNote">🔒 مدیر اصلی سایت به همه‌ی گفتگوهای خصوصی دسترسی دارد.</p>`;
   if(convReadOnly) html += `<p class="mutedNote">حالت نظارت مدیر اصلی — فقط خواندنی</p>`;
   html += `<div id="chatList">${convMsgs.map(chatRowHtml).join('') || '<p style="color:var(--muted)">هنوز پیامی نیست.</p>'}</div>`;
   if(!convReadOnly){
@@ -299,7 +302,7 @@ $('#newConvBtn').onclick = openNewConv;
 
 // ---------------- theme (day/night + color palette) ----------------
 const PALETTES = [
-  {n:'پیش‌فرض', l:{bg:'#f7f6f3',card:'#ffffff',accent:'#a8562f'}, d:{bg:'#171512',card:'#221f1c',accent:'#d97a4d'}},
+  {n:'بیابان', l:{bg:'#f4e6d4',card:'#fff8ee',accent:'#c17a3a'}, d:{bg:'#1b140e',card:'#2a2018',accent:'#d9944f'}},
   {n:'آبی',     l:{bg:'#eaf2fb',card:'#ffffff',accent:'#2f6ea8'}, d:{bg:'#0f1722',card:'#182231',accent:'#5aa0e0'}},
   {n:'سبز',     l:{bg:'#eaf6ee',card:'#ffffff',accent:'#2f8a55'}, d:{bg:'#0f1a13',card:'#17251c',accent:'#5cc487'}},
   {n:'بنفش',    l:{bg:'#f4ecfa',card:'#ffffff',accent:'#8a2f8a'}, d:{bg:'#1a1220',card:'#251a2d',accent:'#c76fc7'}},
@@ -320,6 +323,8 @@ function applyTheme(){
   root.style.setProperty('--bg', c.bg);
   root.style.setProperty('--card', c.card);
   root.style.setProperty('--accent', c.accent);
+  const rgb=[1,3,5].map(i=>parseInt(c.accent.slice(i,i+2),16));
+  root.style.setProperty('--on-accent', (0.299*rgb[0]+0.587*rgb[1]+0.114*rgb[2])>150 ? '#1a120b' : '#ffffff');
   const btn = $('#themeToggleBtn');
   if(btn) btn.textContent = mode==='dark' ? '☀️ حالت روز' : '🌙 حالت شب';
 }

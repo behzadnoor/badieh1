@@ -4,13 +4,15 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>راه بادیه مجازی</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 100 100%27%3E%3Ctext y=%27.9em%27 font-size=%2790%27%3E🌵%3C/text%3E%3C/svg%3E">
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
 
 <div id="authScreen" class="auth-screen">
   <div class="auth-card">
-    <h1>🗣️ راه بادیه مجازی</h1>
+    <h1>🌵 راه بادیه مجازی</h1>
+    <p class="sub">فضایی برای گفتگو، تبادل نظر و اشتراک‌گذاری دانش</p>
     <div class="tabs">
       <button id="tabLogin" class="tab active">ورود</button>
       <button id="tabRegister" class="tab">ثبت‌نام</button>
@@ -36,31 +38,35 @@
 
 <div id="appScreen" class="app-screen" style="display:none">
   <header>
-    <h1>🗣️ راه بادیه مجازی</h1>
-    <input id="searchBox" type="search" placeholder="جستجو در پیام‌ها...">
-    <span id="whoami"></span>
-    <button class="ghost" id="dmBtn">گفتگوی جدید</button>
-    <button class="ghost" id="themeColorBtn">🎨 رنگ</button>
-    <button class="ghost" id="themeToggleBtn">🌓</button>
-    <button class="ghost" id="adminBtn" style="display:none">مدیریت</button>
-    <button class="ghost" id="logoutBtn">خروج</button>
+    <div class="brand"><span class="logo">🌵</span><h1>راه بادیه مجازی</h1></div>
+    <input id="searchBox" type="search" placeholder="🔍 جستجو در پیام‌ها...">
+    <div class="hactions">
+      <span id="whoami"></span>
+      <button class="ghost" id="dmBtn">💬 گفتگوی جدید</button>
+      <button class="ghost" id="themeColorBtn">🎨 رنگ</button>
+      <button class="ghost" id="themeToggleBtn">🌓</button>
+      <button class="ghost" id="adminBtn" style="display:none">⚙️ مدیریت</button>
+      <button class="ghost" id="logoutBtn">خروج</button>
+    </div>
   </header>
   <div class="wrap">
-    <div class="side">
-      <h3>آنلاین</h3>
-      <div id="onlineList"></div>
-      <h3>گفتگوهای خصوصی</h3>
-      <div id="convList"></div>
-      <button class="ghost" id="newConvBtn">+ گفتگوی جدید</button>
-      <h3>اتاق‌ها</h3>
+    <aside class="card side">
+      <h3>📂 تالارها</h3>
       <div id="topicList"></div>
-      <button class="ghost" id="newTopicBtn" style="display:none">+ تاپیک جدید</button>
+      <button class="ghost" id="newTopicBtn" style="display:none">＋ ایجاد تاپیک جدید</button>
+      <h3>💬 گفتگوهای خصوصی</h3>
+      <div id="convList"></div>
+      <button class="ghost" id="newConvBtn">＋ گفتگوی جدید</button>
       <div id="allConvsBox" style="display:none">
-        <h3>همه‌ی گفتگوها (فقط مدیر اصلی)</h3>
+        <h3>🔒 همه‌ی گفتگوها (فقط مدیر اصلی)</h3>
         <div id="allConvList"></div>
       </div>
-    </div>
-    <div class="main" id="mainArea"></div>
+    </aside>
+    <main class="card main" id="mainArea"></main>
+    <aside class="card side">
+      <h3>👥 اعضای آنلاین</h3>
+      <div id="onlineList"></div>
+    </aside>
   </div>
 </div>
 
