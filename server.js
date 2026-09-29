@@ -105,7 +105,17 @@ function requireRole(...roles) {
 function publicUser(u) {
   if (!u) return null;
   const first = db.get('users').first().value();
-  return { id: u.id, username: u.username, displayName: u.displayName, role: u.role, isOwner: !!first && first.id === u.id };
+  return {
+    id: u.id, username: u.username, displayName: u.displayName, role: u.role,
+    isOwner: !!first && first.id === u.id,
+    bio: { education: u.education || '', experience: u.experience || '', skills: u.skills || '' }
+  };
+}
+// full profile for the user themself, and for admins verifying identity —
+// includes fields nobody else should see (real name, email, phone)
+function privateProfile(u) {
+  if (!u) return null;
+  return { ...publicUser(u), realName: u.realName || '', email: u.email || '', phone: u.phone || '' };
 }
 // the "main admin" is the first person who ever registered
 function isOwnerUser(u) {
@@ -137,9 +147,47 @@ db.write();
 })();
 
 const PHONE_REGEX = /^(0|\+98|0098)?9\d{9}$/;
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// ---------- email (for password reset) ----------
+// Configure via env vars on Railway: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM, PUBLIC_URL.
+// If any of these are missing, we don't crash — we just skip actually sending the
+// email and log a warning, so "forgot password" still works logically (admin can
+// always set a new password from the admin panel as a fallback).
+const nodemailer = require('nodemailer');
+let mailTransport = null;
+if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+  mailTransport = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: parseInt(process.env.SMTP_PORT || '587', 10),
+    secure: parseInt(process.env.SMTP_PORT || '587', 10) === 465,
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+  });
+} else {
+  console.warn('⚠️  SMTP not configured (SMTP_HOST/SMTP_USER/SMTP_PASS) — password-reset emails will not actually be sent. Admin can still reset a member\'s password from the admin panel.');
+}
+async function sendResetEmail(user, link) {
+  if (!mailTransport || !user.email) return false;
+  try {
+    await mailTransport.sendMail({
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to: user.email,
+      subject: 'بازیابی رمز عبور — راه بادیه مجازی',
+      text: `برای تعیین رمز عبور جدید روی این لینک بزنید (تا ۱ ساعت معتبر است):\n${link}\n\nاگر این درخواست را شما نداده‌اید، این ایمیل را نادیده بگیرید.`
+    });
+    return true;
+  } catch (e) {
+    console.error('sendResetEmail failed:', e.message);
+    return false;
+  }
+}
+function publicUrl(req) {
+  return process.env.PUBLIC_URL || `${req.protocol}://${req.get('host')}`;
+}
+
 
 app.post('/api/auth/register', (req, res) => {
-  const { username, password, confirmPassword, displayName, phone } = req.body || {};
+  const { username, password, confirmPassword, displayName, phone, email } = req.body || {};
   if (!username || !password || password.length < 4) {
     return res.status(400).json({ error: 'نام کاربری و رمز عبور (حداقل ۴ کاراکتر) لازم است' });
   }
@@ -150,6 +198,10 @@ app.post('/api/auth/register', (req, res) => {
   if (!phoneNormalized || !PHONE_REGEX.test(phoneNormalized)) {
     return res.status(400).json({ error: 'شماره موبایل معتبر وارد کنید (مثال: 0912xxxxxxx)' });
   }
+  const emailNormalized = (email || '').trim();
+  if (emailNormalized && !EMAIL_REGEX.test(emailNormalized)) {
+    return res.status(400).json({ error: 'ایمیل معتبر وارد کنید یا خالی بگذارید' });
+  }
   if (db.get('users').find({ username }).value()) {
     return res.status(400).json({ error: 'این نام کاربری قبلا ثبت شده' });
   }
@@ -158,6 +210,7 @@ app.post('/api/auth/register', (req, res) => {
     id: uuid(),
     username,
     phone: phoneNormalized,
+    email: emailNormalized,
     passwordHash: bcrypt.hashSync(password, 10),
     displayName: displayName || username,
     role: isFirstUser ? 'admin' : 'pending', // first registered user becomes admin automatically
@@ -165,7 +218,40 @@ app.post('/api/auth/register', (req, res) => {
   };
   db.get('users').push(user).write();
   req.session.userId = user.id;
+  if (!isFirstUser) {
+    io.to('admins').emit('newMember', { id: user.id, displayName: user.displayName, username: user.username });
+    emitPendingCount();
+  }
   res.json({ user: publicUser(user) });
+});
+
+// ---------- forgot / reset password ----------
+app.post('/api/auth/forgot', (req, res) => {
+  const identifier = String((req.body || {}).identifier || '').trim();
+  const generic = { ok: true, message: 'اگر چنین حسابی وجود داشته باشد، ایمیل بازیابی برایش ارسال شد. اگر ایمیلی ثبت نکرده‌اید یا ایمیل نرسید، از بخش «ارتباط با مدیر» کمک بگیرید.' };
+  if (!identifier) return res.json(generic);
+  const user = db.get('users').find(u => u.username === identifier || (u.email && u.email.toLowerCase() === identifier.toLowerCase())).value();
+  if (!user) return res.json(generic); // don't reveal whether the account exists
+  const token = uuid();
+  db.get('resetTokens').push({ token, userId: user.id, expires: Date.now() + 60 * 60 * 1000 }).write();
+  const link = `${publicUrl(req)}/?reset=${token}`;
+  sendResetEmail(user, link); // fire-and-forget; missing SMTP config just means no email goes out
+  res.json(generic);
+});
+
+app.post('/api/auth/reset', (req, res) => {
+  const { token, newPassword, confirmPassword } = req.body || {};
+  if (!token) return res.status(400).json({ error: 'لینک نامعتبر است' });
+  const rec = db.get('resetTokens').find({ token }).value();
+  if (!rec || rec.expires < Date.now()) return res.status(400).json({ error: 'لینک منقضی یا نامعتبر است — دوباره درخواست بازیابی رمز بدهید' });
+  if (!newPassword || newPassword.length < 4) return res.status(400).json({ error: 'رمز جدید حداقل ۴ کاراکتر باشد' });
+  if (newPassword !== confirmPassword) return res.status(400).json({ error: 'رمز جدید و تکرار آن یکسان نیستند' });
+  const user = db.get('users').find({ id: rec.userId });
+  if (!user.value()) return res.status(404).json({ error: 'کاربر پیدا نشد' });
+  user.assign({ passwordHash: bcrypt.hashSync(newPassword, 10) }).write();
+  db.get('resetTokens').remove(t => t.userId === rec.userId).write();
+  req.session.userId = user.value().id;
+  res.json({ ok: true, user: publicUser(user.value()) });
 });
 
 app.post('/api/auth/login', (req, res) => {
@@ -185,11 +271,19 @@ app.post('/api/auth/logout', (req, res) => {
 
 app.get('/api/me', (req, res) => {
   const u = currentUser(req);
-  res.json({ user: u ? { ...publicUser(u), phone: u.phone || '' } : null });
+  res.json({ user: u ? privateProfile(u) : null });
+});
+
+// admin-only: who to contact if you forget your password / need help — shown
+// on the login screen, no auth required so a locked-out person can still see it
+app.get('/api/public/admin-contact', (req, res) => {
+  const first = db.get('users').first().value();
+  if (!first) return res.json({ contact: null });
+  res.json({ contact: { displayName: first.displayName, phone: first.phone || '' } });
 });
 
 app.patch('/api/me', requireAuth, (req, res) => {
-  const { displayName, phone, currentPassword, newPassword, confirmPassword } = req.body || {};
+  const { displayName, phone, email, realName, education, experience, skills, currentPassword, newPassword, confirmPassword } = req.body || {};
   const changes = {};
   if (displayName !== undefined) {
     const n = String(displayName).trim();
@@ -201,6 +295,15 @@ app.patch('/api/me', requireAuth, (req, res) => {
     if (!PHONE_REGEX.test(ph)) return res.status(400).json({ error: 'شماره موبایل معتبر وارد کنید (مثال: 0912xxxxxxx)' });
     changes.phone = ph;
   }
+  if (email !== undefined) {
+    const em = String(email).trim();
+    if (em && !EMAIL_REGEX.test(em)) return res.status(400).json({ error: 'ایمیل معتبر وارد کنید' });
+    changes.email = em;
+  }
+  if (realName !== undefined) changes.realName = String(realName).trim().slice(0, 80);
+  if (education !== undefined) changes.education = String(education).trim().slice(0, 300);
+  if (experience !== undefined) changes.experience = String(experience).trim().slice(0, 500);
+  if (skills !== undefined) changes.skills = String(skills).trim().slice(0, 300);
   if (newPassword) {
     if (!bcrypt.compareSync(currentPassword || '', req.user.passwordHash)) return res.status(400).json({ error: 'رمز عبور فعلی اشتباه است' });
     if (newPassword.length < 4) return res.status(400).json({ error: 'رمز جدید حداقل ۴ کاراکتر باشد' });
@@ -217,7 +320,7 @@ app.patch('/api/me', requireAuth, (req, res) => {
     if (on) { on.displayName = changes.displayName; io.emit('presence', presenceList()); }
   }
   io.emit('userUpdated', publicUser(u.value()));
-  res.json({ user: { ...publicUser(u.value()), phone: u.value().phone || '' } });
+  res.json({ user: privateProfile(u.value()) });
 });
 
 app.get('/api/messages/:id', requireAuth, (req, res) => {
@@ -236,7 +339,8 @@ app.post('/api/attachments', requireAuth, requireRole('admin', 'member'), runUpl
 
 // ---------- users / admin ----------
 app.get('/api/users', requireAuth, requireRole('admin'), (req, res) => {
-  res.json({ users: db.get('users').map(publicUser).value() });
+  // admins get the identity-verification fields (real name, phone, email) too
+  res.json({ users: db.get('users').map(privateProfile).value() });
 });
 
 // list of approved members (admin + member), for anyone to start a DM with —
@@ -259,10 +363,57 @@ app.post('/api/users/:id/role', requireAuth, requireRole('admin'), (req, res) =>
   if (!target.value()) return res.status(404).json({ error: 'کاربر پیدا نشد' });
   target.assign({ role }).write();
   io.emit('userUpdated', publicUser(target.value()));
+  emitPendingCount();
   res.json({ ok: true });
 });
 
-// ---------- topics ----------
+// admin sets a brand-new password for a member (e.g. they forgot theirs and
+// contacted the admin directly) — the admin never sees the old password,
+// since it's hashed and unrecoverable; this issues a fresh one instead
+app.post('/api/users/:id/set-password', requireAuth, requireRole('admin'), (req, res) => {
+  const { newPassword } = req.body || {};
+  if (!newPassword || newPassword.length < 4) return res.status(400).json({ error: 'رمز جدید حداقل ۴ کاراکتر باشد' });
+  const target = db.get('users').find({ id: req.params.id });
+  if (!target.value()) return res.status(404).json({ error: 'کاربر پیدا نشد' });
+  target.assign({ passwordHash: bcrypt.hashSync(newPassword, 10) }).write();
+  res.json({ ok: true });
+});
+
+app.get('/api/pending-count', requireAuth, requireRole('admin'), (req, res) => {
+  res.json({ count: db.get('users').filter({ role: 'pending' }).size().value() });
+});
+function emitPendingCount() {
+  io.to('admins').emit('pendingCount', { count: db.get('users').filter({ role: 'pending' }).size().value() });
+}
+
+// ---------- halls (categories that group several topics/threads) ----------
+app.get('/api/halls', requireAuth, (req, res) => {
+  res.json({ halls: db.get('halls').value() });
+});
+app.post('/api/halls', requireAuth, requireRole('admin'), (req, res) => {
+  const { title, description } = req.body || {};
+  if (!title || !title.trim()) return res.status(400).json({ error: 'عنوان تالار لازم است' });
+  const hall = { id: uuid(), title: title.trim().slice(0, 100), description: (description || '').trim().slice(0, 200), createdAt: Date.now() };
+  db.get('halls').push(hall).write();
+  io.emit('hallsChanged');
+  res.json({ hall });
+});
+app.patch('/api/halls/:id', requireAuth, requireRole('admin'), (req, res) => {
+  const hall = db.get('halls').find({ id: req.params.id });
+  if (!hall.value()) return res.status(404).json({ error: 'تالار پیدا نشد' });
+  const { title, description } = req.body || {};
+  const changes = {};
+  if (title !== undefined) {
+    if (!String(title).trim()) return res.status(400).json({ error: 'عنوان نمی‌تواند خالی باشد' });
+    changes.title = String(title).trim().slice(0, 100);
+  }
+  if (description !== undefined) changes.description = String(description).trim().slice(0, 200);
+  hall.assign(changes).write();
+  io.emit('hallsChanged');
+  res.json({ hall: hall.value() });
+});
+
+// ---------- topics (threads) — optionally nested under a hall ----------
 app.get('/api/topics', requireAuth, (req, res) => {
   res.json({ topics: db.get('topics').value() });
 });
@@ -279,9 +430,10 @@ function notifyUsers(ids, exceptId, payload) {
 }
 
 app.post('/api/topics', requireAuth, requireRole('admin'), (req, res) => {
-  const { title, description } = req.body || {};
+  const { title, description, hallId } = req.body || {};
   if (!title || !title.trim()) return res.status(400).json({ error: 'عنوان لازم است' });
-  const topic = { id: uuid(), title: title.trim().slice(0, 100), description: (description || '').trim().slice(0, 200), pdfFile: null, pdfName: null, createdAt: Date.now() };
+  if (hallId && !db.get('halls').find({ id: hallId }).value()) return res.status(400).json({ error: 'تالار انتخاب‌شده پیدا نشد' });
+  const topic = { id: uuid(), hallId: hallId || null, title: title.trim().slice(0, 100), description: (description || '').trim().slice(0, 200), pdfFile: null, pdfName: null, createdAt: Date.now() };
   db.get('topics').push(topic).write();
   io.emit('newTopic', topic);
   res.json({ topic });
@@ -290,13 +442,17 @@ app.post('/api/topics', requireAuth, requireRole('admin'), (req, res) => {
 app.patch('/api/topics/:id', requireAuth, requireRole('admin'), (req, res) => {
   const topic = db.get('topics').find({ id: req.params.id });
   if (!topic.value()) return res.status(404).json({ error: 'تاپیک پیدا نشد' });
-  const { title, description } = req.body || {};
+  const { title, description, hallId } = req.body || {};
   const changes = {};
   if (title !== undefined) {
     if (!String(title).trim()) return res.status(400).json({ error: 'عنوان نمی‌تواند خالی باشد' });
     changes.title = String(title).trim().slice(0, 100);
   }
   if (description !== undefined) changes.description = String(description).trim().slice(0, 200);
+  if (hallId !== undefined) {
+    if (hallId && !db.get('halls').find({ id: hallId }).value()) return res.status(400).json({ error: 'تالار انتخاب‌شده پیدا نشد' });
+    changes.hallId = hallId || null;
+  }
   topic.assign(changes).write();
   io.emit('topicUpdated', topic.value());
   notifyUsers(topicAudience(req.params.id), req.user.id, { kind: 'topic', topicId: req.params.id, topicTitle: topic.value().title, from: req.user.displayName, text: 'عنوان یا توضیح این تالار تغییر کرد' });
@@ -547,6 +703,7 @@ io.on('connection', (socket) => {
 
   socket.join(`user:${userId}`);
   if (isOwnerUser(user)) socket.join('owner');
+  if (user.role === 'admin') socket.join('admins');
   onlineUsers.set(userId, { displayName: user.displayName, lastSeen: Date.now() });
   io.emit('presence', Array.from(onlineUsers.entries()).map(([id, v]) => ({ id, ...v })));
 

@@ -111,3 +111,18 @@ header button.ghost:hover{background:rgba(255,255,255,.34)}
 .msg.highlight{animation:hl 2.4s ease}
 @keyframes hl{0%{box-shadow:0 0 0 4px color-mix(in srgb,var(--accent) 55%,transparent)}100%{box-shadow:none}}
 .profileForm input{margin-bottom:10px}
+
+/* ---- phase 4 additions ---- */
+.authLogo svg{width:28px;height:28px;vertical-align:middle;color:var(--accent)}
+.logo svg{width:26px;height:26px;color:#fff}
+.auth-card .hint a{color:var(--accent);text-decoration:none;font-weight:bold}
+.auth-card .hint a:hover{text-decoration:underline}
+.hallGroup{margin-top:4px}
+.hallHead{font-size:13px;color:var(--muted);padding:6px 6px 2px;display:flex;align-items:center;gap:4px}
+.hallHead .hsm{padding:2px 6px;font-size:11px;cursor:pointer;border:none;background:transparent;color:var(--muted)}
+.hallHead .hsm:hover{color:var(--accent)}
+.hallKids{padding-right:10px;border-right:2px dashed var(--line);margin-right:6px}
+.composer{display:flex;flex-direction:column;gap:8px}
+.composer textarea{margin:0}
+.composerTools{display:flex;gap:6px;align-items:center;justify-content:flex-start}
+.composerTools button:not(.iconbtn){margin-right:auto}

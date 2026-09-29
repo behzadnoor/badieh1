@@ -7,11 +7,12 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "bcryptjs": "^2.4.3",
     "express": "^4.19.2",
     "express-session": "^1.18.0",
-    "bcryptjs": "^2.4.3",
     "lowdb": "^1.0.0",
     "multer": "^2.0.1",
+    "nodemailer": "^10.0.12",
     "socket.io": "^4.7.5",
     "uuid": "^9.0.1"
   }
