@@ -10,7 +10,8 @@ let convs = [], allConvs = [], currentConv = null, convReadOnly = false, convMsg
 const unread = {};
 let pendingAtt = null;       // {id, kind, name, url} staged for the topic composer
 let pendingChatAtt = null;   // same, for the chat composer
-let settings = { topicOpenMode: 'scroll' };
+let settings = { topicOpenMode: 'scroll', recoveryMethod: 'admin' }, emailAvailable = false;
+let pendingMembers = 0, pendingMsgs = 0;
 let searchQuery = '', searchTimer = null;
 let mobileView = 'content';   // only matters in "separate page" mode on phones: 'list' | 'content'
 const isNarrow = () => window.matchMedia('(max-width:1000px)').matches;
@@ -61,16 +62,18 @@ $('#registerForm').onsubmit = async (e)=>{
 };
 
 // ---------------- forgot password / reset password / contact admin ----------------
-async function adminContact(){
-  try{ const { contact } = await api('/api/public/admin-contact'); return contact; }catch(e){ return null; }
+async function recoveryInfo(){
+  try{ return await api('/api/public/recovery-info'); }catch(e){ return { method:'admin', contact:null }; }
 }
-function openForgot(){
+async function openForgot(){
+  const info = await recoveryInfo();
+  if(info.method==='admin'){ openContactAdmin(true); return; }   // email is not the chosen method: go straight to the admin
   openModal(`<h3>فراموشی رمز عبور</h3>
-    <p class="mutedNote">نام کاربری یا ایمیل خود را وارد کنید</p>
+    <p class="mutedNote">نام کاربری یا ایمیل خود را وارد کنید تا لینک بازیابی برایتان ایمیل شود.</p>
     <input id="forgotId" placeholder="نام کاربری یا ایمیل">
     <p class="err" id="forgotErr"></p>
     <p id="forgotMsg" class="mutedNote"></p>
-    <div style="display:flex;gap:8px;justify-content:flex-end"><button class="ghost" onclick="closeModal()">بستن</button><button onclick="submitForgot()">ارسال درخواست</button></div>`);
+    <div style="display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap"><button class="ghost" style="margin-left:auto" onclick="openContactAdmin(true)">ایمیل ندارم / ایمیل نرسید</button><button class="ghost" onclick="closeModal()">بستن</button><button onclick="submitForgot()">ارسال لینک</button></div>`);
 }
 async function submitForgot(){
   const id = $('#forgotId').value.trim(); if(!id){ $('#forgotErr').textContent='نام کاربری یا ایمیل را وارد کنید'; return; }
@@ -80,11 +83,37 @@ async function submitForgot(){
     $('#forgotMsg').textContent = message;
   }catch(e){ $('#forgotErr').textContent = e.message; }
 }
-async function openContactAdmin(){
-  const c = await adminContact();
-  openModal(`<h3>ارتباط با مدیر</h3>
-    ${c ? `<p>می‌توانید برای کمک (مثلاً بازیابی رمز عبور) با مدیر سایت تماس بگیرید:</p><p style="font-size:18px;font-weight:bold;color:var(--accent)">${esc(c.displayName)} — ${esc(c.phone||'—')}</p>` : `<p class="mutedNote">اطلاعات تماس مدیر هنوز ثبت نشده.</p>`}
-    <div style="text-align:left"><button class="ghost" onclick="closeModal()">بستن</button></div>`);
+let contactOpenedAt = 0;
+async function openContactAdmin(forgot){
+  const { contact: c } = await recoveryInfo();
+  const phoneHtml = (c && c.phone)
+    ? `<p>تماس تلفنی با ${esc(c.displayName)}:</p><p><a class="phoneLink" href="tel:${esc(c.phone)}">📞 ${esc(c.phone)}</a></p>`
+    : `<p class="mutedNote">شماره‌ی تماس مدیر هنوز ثبت نشده.</p>`;
+  contactOpenedAt = Date.now();
+  openModal(`<h3>${forgot?'فراموشی رمز عبور — ارتباط با مدیر':'ارتباط با مدیر'}</h3>
+    ${forgot?'<p class="mutedNote">برای رمز جدید، مدیر باید هویت شما را تایید کند. یا تماس بگیرید یا پیام بفرستید.</p>':''}
+    ${phoneHtml}
+    <hr style="border-color:var(--line)">
+    <p class="mutedNote">یا همین‌جا پیام بفرستید (مدیر در سایت می‌بیند):</p>
+    <input id="cmName" placeholder="نام شما">
+    <input id="cmUser" placeholder="نام کاربری (اگر دارید)" autocapitalize="none" autocomplete="off">
+    <input id="cmContact" type="tel" placeholder="شماره‌ی تماس برای پاسخ (اختیاری)">
+    <textarea id="cmText" maxlength="500" placeholder="پیام شما (حداکثر ۵۰۰ کاراکتر)" style="min-height:90px"></textarea>
+    <input id="cmWebsite" type="text" tabindex="-1" autocomplete="off" aria-hidden="true" style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0">
+    <p class="err" id="cmErr"></p><p id="cmOk" class="mutedNote" style="color:var(--accent);font-weight:bold"></p>
+    <div style="display:flex;gap:8px;justify-content:flex-end"><button class="ghost" onclick="closeModal()">بستن</button><button id="cmSend" onclick="sendContactAdmin()">ارسال پیام</button></div>`);
+}
+async function sendContactAdmin(){
+  $('#cmErr').textContent=''; $('#cmOk').textContent='';
+  const btn=$('#cmSend'); btn.disabled=true;
+  try{
+    await api('/api/public/contact-admin', { method:'POST', body:{
+      name:$('#cmName').value, username:$('#cmUser').value, contact:$('#cmContact').value, text:$('#cmText').value,
+      website:$('#cmWebsite').value, elapsed: Date.now()-contactOpenedAt } });
+    $('#cmOk').textContent = '✅ پیام شما برای مدیر فرستاده شد. مدیر پس از بررسی با شما هماهنگ می‌کند.';
+    $('#cmText').value='';
+  }catch(e){ $('#cmErr').textContent = e.message; btn.disabled=false; return; }
+  setTimeout(()=>{ const b=$('#cmSend'); if(b) b.disabled=false; }, 4000);
 }
 $('#resetForm').onsubmit = async (e)=>{
   e.preventDefault();
@@ -115,7 +144,7 @@ function startApp(user){
   $('#authScreen').style.display='none';
   $('#appScreen').style.display='block';
   $('#whoami').textContent = `${me.displayName} (${roleLabel(me.role)})`;
-  if(me.role==='admin'){ $('#newHallBtn').style.display='inline-block'; $('#adminBtn').style.display='inline-block'; api('/api/pending-count').then(d=>updatePendingBadge(d.count)).catch(()=>{}); }
+  if(me.role==='admin'){ $('#newHallBtn').style.display='inline-block'; $('#adminBtn').style.display='inline-block'; api('/api/pending-count').then(d=>updatePendingBadge(d.count)).catch(()=>{}); if(me.isOwner) api('/api/admin-messages').then(d=>{ pendingMsgs=d.unhandled; refreshAdminBadge(); }).catch(()=>{}); }
   connectSocket();
   loadHalls();
   loadSettings().then(()=>loadTopics()).then(()=>jumpToMsgFromUrl());
@@ -124,7 +153,7 @@ function startApp(user){
 
 // ---------------- site settings + how a topic opens on phones ----------------
 async function loadSettings(){
-  try{ settings = (await api('/api/settings')).settings; }catch(e){}
+  try{ const r = await api('/api/settings'); settings = r.settings; emailAvailable = !!r.emailAvailable; }catch(e){}
   applyViewMode();
 }
 function applyViewMode(){
@@ -145,8 +174,8 @@ function revealMain(){
   el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');
 }
 async function saveSetting(key, value){
-  try{ await api('/api/settings', { method:'PATCH', body:{ [key]: value } }); toast('✅ تنظیمات ذخیره شد'); }
-  catch(e){ alert(e.message); }
+  try{ await api('/api/settings', { method:'PATCH', body:{ [key]: value } }); settings[key] = value; toast('✅ تنظیمات ذخیره شد'); }
+  catch(e){ alert(e.message); if($('#modalRoot').innerHTML) openSettings(); }
 }
 function roleLabel(r){ return {admin:'مدیر', member:'عضو', pending:'در انتظار تایید', blocked:'مسدود'}[r] || r; }
 function canWrite(){ return me && (me.role==='admin' || me.role==='member'); }
@@ -178,7 +207,7 @@ function connectSocket(){
   socket.on('newMember', (n)=>{ toast(`🆕 عضو جدید: ${n.displayName} — منتظر تایید`); });
   socket.on('pendingCount', ({count})=> updatePendingBadge(count));
   socket.on('hallsChanged', ()=> loadHalls());
-  socket.on('settingsChanged', (st)=>{ settings = st; applyViewMode(); });
+  socket.on('settingsChanged', (st)=>{ settings = { ...settings, ...st }; applyViewMode(); });
   socket.on('topicDeleted', ({id})=>{
     topics = topics.filter(x=>x.id!==id);
     if(currentTopic===id){
@@ -187,7 +216,14 @@ function connectSocket(){
       if(g) selectTopic(g.id); else { renderTopics(); renderMain(); }
     } else renderTopics();
   });
+  socket.on('adminMessage', (n)=>{ pendingMsgs++; refreshAdminBadge(); toast(`📨 پیام تازه برای مدیر از ${n.name||'یک کاربر'}`); });
+  socket.on('chatMessageUpdated', ({msg})=>{
+    if(msg.convId!==currentConv) return;
+    const i = convMsgs.findIndex(x=>x.id===msg.id);
+    if(i>-1){ convMsgs[i] = msg; renderChat(); }
+  });
   socket.on('notify', (n)=>{
+    if(n.kind==='reaction'){ toast(`${n.icon} ${n.from} به پیام شما در «${n.topicTitle||''}» واکنش داد${n.text?': '+n.text:''}`); return; }
     const icon = n.kind==='reply' ? '↩️' : (n.kind==='topic' ? '📌' : '💬');
     toast(`${icon} ${esc(n.from)} — ${esc(n.topicTitle||'')}${n.text?': '+esc(n.text):''}`);
   });
@@ -218,7 +254,7 @@ function renderTopics(){
       <div class="hallKids">${kids.map(topicItemHtml).join('') || '<p class="mutedNote" style="margin:2px 10px">هنوز جلسه‌ای نیست.</p>'}</div>
     </div>`;
   }).join('');
-  $('#topicList').innerHTML = html || '<p style="font-size:12px;color:var(--muted)">هنوز اتاقی نیست.</p>';
+  $('#topicList').innerHTML = html || '<p style="font-size:0.75rem;color:var(--muted)">هنوز اتاقی نیست.</p>';
   document.querySelectorAll('#topicList .topic').forEach(el=>el.onclick=()=>selectTopic(el.dataset.id,{reveal:true}));
 }
 async function loadHalls(){ try{ const { halls: h } = await api('/api/halls'); halls = h; renderTopics(); }catch(e){} }
@@ -253,15 +289,18 @@ function attachHtml(a){
 function msgRowHtml(m, ref, extraActions){
   const canSpeak = !!(window.speechSynthesis && m.text);
   const mineRx = (m.reactions||{})[me.id];
-  const rx = (kind, icon, n)=>`<span class="rx ${mineRx===kind?'mine':''}" onclick="react('${m.id}','${kind}')">${icon} ${n||0}</span>`;
+  const rx = (kind, icon, n)=>`<span class="rx ${mineRx===kind?'mine':''}" data-kind="${kind}" onmouseenter="rxHover(this,'${m.id}')" onclick="react('${m.id}','${kind}')">${icon} ${n||0}</span>`;
+  const anyRx = (m.likes||0)+(m.dislikes||0)+(m.thanks||0) > 0;
   return `<div class="msg ${m.pinned?'pinned':''}" id="m_${m.id}">
-      <div class="meta">${avatar(m.authorName)}<b>${esc(m.authorName)}</b> ${m.pinned?'<span class="badge">پین‌شده</span>':''} <span>${fmtTime(m.time)}</span></div>
+      <div class="meta">${avatar(m.authorName)}<b>${esc(m.authorName)}</b> ${m.pinned?'<span class="badge">پین‌شده</span>':''} <span>${fmtTime(m.time)}</span>${m.edited?'<span class="editedTag">(ویرایش‌شده)</span>':''}</div>
       ${ref?`<div class="reply-ref">در پاسخ به ${esc(ref.authorName)}: ${esc(ref.text.slice(0,60))}</div>`:''}
       ${m.text?`<div>${esc(m.text)}</div>`:''}
       ${attachHtml(m.attachment)}
       <div class="actions">
         ${rx('likes','👍',m.likes)}${rx('dislikes','👎',m.dislikes)}${rx('thanks','🙏',m.thanks)}
+        ${anyRx?`<span onclick="showReactors('${m.id}')">👥 چه کسانی؟</span>`:''}
         ${canWrite()?`<span onclick="setReply('${m.id}')">پاسخ</span>`:''}
+        ${(canWrite() && m.userId===me.id)?`<span onclick="editMsg('${m.id}','topic')">✏️ ویرایش</span>`:''}
         ${(me.role==='admin'||m.userId===me.id)?`<span onclick="delMsg('${m.id}')">حذف</span>`:''}
         ${me.role==='admin'?`<span onclick="togglePin('${m.id}',${!m.pinned})">${m.pinned?'برداشتن پین':'پین کردن'}</span>`:''}
         <span onclick="shareMsgLink('${m.id}')">🔗 لینک</span>
@@ -285,7 +324,7 @@ function renderMain(){
   }).join('') || '<p style="color:var(--muted)">پیامی نیست.</p>') + `</div>`;
 
   if(canWrite()){
-    html += `<div style="display:${replyTo?'block':'none'};font-size:12px;color:var(--muted)">در حال پاسخ <span onclick="clearReply()" style="cursor:pointer;color:var(--accent)">✕ لغو</span></div>
+    html += `<div style="display:${replyTo?'block':'none'};font-size:0.75rem;color:var(--muted)">در حال پاسخ <span onclick="clearReply()" style="cursor:pointer;color:var(--accent)">✕ لغو</span></div>
     <div class="composerRow">
       <div class="composer">
         <textarea id="composerInput" placeholder="پیام خود را بنویسید..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMsg();}"></textarea>
@@ -361,6 +400,47 @@ async function deleteTopic(id){
   const t = topics.find(x=>x.id===id); if(!t || t.general) return;
   if(!confirm(`تاپیک «${t.title}» با همه‌ی پیام‌ها و فایل‌هایش برای همیشه حذف شود؟\nاین کار قابل بازگشت نیست.`)) return;
   try{ await api(`/api/topics/${id}`, { method:'DELETE' }); closeModal(); }catch(e){ alert(e.message); }
+}
+
+// ---------------- who reacted ----------------
+const RX_ICON = { likes:'👍', dislikes:'👎', thanks:'🙏' };
+async function fetchReactors(id){ return api(`/api/messages/${id}/reactors`); }
+// desktop: hovering a reaction shows the names as a tooltip
+async function rxHover(el, id){
+  if(el._loading) return; el._loading = true;
+  try{
+    const d = await fetchReactors(id); const k = el.dataset.kind;
+    const names = d[k] || [], anon = (d.unnamed||{})[k]||0;
+    el.title = names.length || anon ? [...names, ...(anon?[`${anon} نفر (قدیمی، بدون نام)`]:[])].join('، ') : 'هنوز کسی نداده';
+  }catch(e){}
+  setTimeout(()=>{ el._loading=false; }, 1500);
+}
+// phone/tablet (and desktop): "چه کسانی؟" lists every name per reaction
+async function showReactors(id){
+  let d; try{ d = await fetchReactors(id); }catch(e){ toast(e.message); return; }
+  const rows = ['likes','dislikes','thanks'].map(k=>{
+    const names = d[k]||[], anon = (d.unnamed||{})[k]||0;
+    if(!names.length && !anon) return '';
+    return `<div class="rxRow"><b>${RX_ICON[k]}</b> ${names.map(esc).join('، ')}${anon?`${names.length?'، ':''}<span class="mutedNote">${anon} نفر (قدیمی، بدون نام)</span>`:''}</div>`;
+  }).join('');
+  openModal(`<h3>واکنش‌ها</h3>${rows || '<p class="mutedNote">هنوز واکنشی نیست.</p>'}<div style="margin-top:12px;text-align:left"><button class="ghost" onclick="closeModal()">بستن</button></div>`);
+}
+
+// ---------------- edit my own message (topic or chat) ----------------
+function editMsg(id, where){
+  const m = (where==='chat' ? convMsgs : messages).find(x=>x.id===id); if(!m) return;
+  openModal(`<h3>ویرایش پیام</h3>
+    <textarea id="editMsgText" style="min-height:120px" maxlength="4000">${esc(m.text||'')}</textarea>
+    <p class="err" id="editMsgErr"></p>
+    <div style="display:flex;gap:8px;justify-content:flex-end"><button class="ghost" onclick="closeModal()">انصراف</button><button onclick="saveMsgEdit('${id}','${where}')">ذخیره</button></div>`);
+  const ta = $('#editMsgText'); ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length);
+}
+async function saveMsgEdit(id, where){
+  const text = $('#editMsgText').value;
+  try{
+    await api(where==='chat' ? `/api/chatmsg/${id}` : `/api/messages/${id}`, { method:'PATCH', body:{ text } });
+    closeModal();
+  }catch(e){ $('#editMsgErr').textContent = e.message; }
 }
 
 // ---------------- search (all topics, with results list) ----------------
@@ -640,7 +720,7 @@ function renderOnline(){
     const click = (me && id!==me.id) ? ` onclick="startDm('${id}')" style="cursor:pointer" title="شروع گفتگوی خصوصی"` : '';
     return `<div${click}><span class="dot ${u.offline?'off':''}"></span>${esc(u.displayName)}${u.offline?` — آخرین بازدید ${fmtTime(u.lastSeen)}`:''}</div>`;
   });
-  $('#onlineList').innerHTML = items.join('') || '<div style="font-size:12px;color:var(--muted)">کسی آنلاین نیست</div>';
+  $('#onlineList').innerHTML = items.join('') || '<div style="font-size:0.75rem;color:var(--muted)">کسی آنلاین نیست</div>';
 }
 
 // ---------------- modal helper ----------------
@@ -650,21 +730,16 @@ function closeModal(){ $('#modalRoot').innerHTML=''; }
 // ---------------- admin panel ----------------
 $('#adminBtn').onclick = async ()=>{
   const { users } = await api('/api/users');
-  openModal(`<h3>مدیریت اعضا</h3>${users.map(u=>`
+  openModal(`<h3>مدیریت اعضا</h3>${me.isOwner?`<div class="adminTools"><button class="ghost" onclick="openInbox()">📨 صندوق پیام‌ها${pendingMsgs?` <span class="badge">${pendingMsgs}</span>`:''}</button><button class="ghost" onclick="openSettings()">⚙️ تنظیمات سایت</button></div>`:''}${users.map(u=>`
     <div class="userRow" style="flex-wrap:wrap">
       <span>${esc(u.displayName)} (${esc(u.username)})${u.realName?` — نام واقعی: ${esc(u.realName)}`:''}${u.phone?` — ${esc(u.phone)}`:''}</span>
       <span style="display:flex;gap:6px;align-items:center">
         <select onchange="setRole('${u.id}', this.value)" ${u.id===me.id?'disabled':''}>
           ${['admin','member','pending','blocked'].map(r=>`<option value="${r}" ${r===u.role?'selected':''}>${roleLabel(r)}</option>`).join('')}
         </select>
-        <span class="iconbtn" style="cursor:pointer;font-size:11px" onclick="adminSetPassword('${u.id}','${esc(u.displayName)}')">تعیین رمز جدید</span>
+        <span class="iconbtn" style="cursor:pointer;font-size:0.6875rem" onclick="adminSetPassword('${u.id}','${esc(u.displayName)}')">تعیین رمز جدید</span>
       </span>
-    </div>`).join('')}${me.isOwner?`<h3 style="margin-top:18px">⚙️ تنظیمات سایت</h3>
-    <p class="mutedNote">نحوه‌ی باز شدن تاپیک روی گوشی:</p>
-    <select onchange="saveSetting('topicOpenMode',this.value)">
-      <option value="scroll" ${settings.topicOpenMode!=='page'?'selected':''}>اسکرول خودکار به محتوا (پیشنهادی)</option>
-      <option value="page" ${settings.topicOpenMode==='page'?'selected':''}>صفحه‌ی جدا با دکمه‌ی بازگشت</option>
-    </select>`:''}<div style="margin-top:12px;text-align:left"><button class="ghost" onclick="closeModal()">بستن</button></div>`);
+    </div>`).join('')}<div style="margin-top:12px;text-align:left"><button class="ghost" onclick="closeModal()">بستن</button></div>`);
 };
 async function setRole(id, role){ await api(`/api/users/${id}/role`, { method:'POST', body:{ role } }); $('#adminBtn').click(); }
 async function adminSetPassword(id, name){
@@ -672,10 +747,48 @@ async function adminSetPassword(id, name){
   try{ await api(`/api/users/${id}/set-password`, { method:'POST', body:{ newPassword: np } }); alert('رمز جدید تنظیم شد. آن را به کاربر اطلاع دهید.'); }
   catch(e){ alert(e.message); }
 }
-function updatePendingBadge(n){
+function openSettings(){
+  if(!me.isOwner) return;
+  const rm = settings.recoveryMethod || 'admin';
+  const dis = emailAvailable ? '' : 'disabled';
+  openModal(`<h3>⚙️ تنظیمات سایت</h3>
+    <p class="mutedNote">روش بازیابی رمز عبور (وقتی کاربر رمزش را فراموش می‌کند):</p>
+    <select onchange="saveSetting('recoveryMethod',this.value)">
+      <option value="admin" ${rm==='admin'?'selected':''}>فقط تماس با مدیر (تلفن + پیام داخل سایت)</option>
+      <option value="email" ${rm==='email'?'selected':''} ${dis}>فقط ایمیل خودکار</option>
+      <option value="both" ${rm==='both'?'selected':''} ${dis}>هر دو (ایمیل و تماس با مدیر)</option>
+    </select>
+    ${emailAvailable?'':'<p class="mutedNote">گزینه‌های ایمیل فعلاً غیرفعال‌اند چون ارسال ایمیل روی سرور راه‌اندازی نشده.</p>'}
+    <p class="mutedNote" style="margin-top:14px">نحوه‌ی باز شدن تاپیک روی گوشی:</p>
+    <select onchange="saveSetting('topicOpenMode',this.value)">
+      <option value="scroll" ${settings.topicOpenMode!=='page'?'selected':''}>اسکرول خودکار به محتوا (پیشنهادی)</option>
+      <option value="page" ${settings.topicOpenMode==='page'?'selected':''}>صفحه‌ی جدا با دکمه‌ی بازگشت</option>
+    </select>
+    <div style="margin-top:14px;display:flex;gap:8px;justify-content:flex-end"><button class="ghost" onclick="$('#adminBtn').click()">← مدیریت</button><button class="ghost" onclick="closeModal()">بستن</button></div>`);
+}
+async function openInbox(){
+  if(!me.isOwner) return;
+  let list = [];
+  try{ const d = await api('/api/admin-messages'); list = d.messages; pendingMsgs = d.unhandled; refreshAdminBadge(); }catch(e){ alert(e.message); return; }
+  openModal(`<h3>📨 صندوق پیام‌ها</h3>
+    ${list.map(m=>`<div class="inboxItem ${m.handled?'done':''}">
+      <div class="mutedNote"><b>${esc(m.name||m.username)}</b>${m.username?` (${esc(m.username)})`:''}${m.loggedIn?' ✔️ واردشده':''}${m.contact?` — ${esc(m.contact)}`:''} · ${fmtDate(m.time)} ${fmtTime(m.time)}</div>
+      <div style="margin:6px 0;white-space:pre-wrap">${esc(m.text)}</div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        ${m.userId?`<button class="iconbtn" onclick="adminSetPassword('${m.userId}','${esc(m.name||m.username).replace(/'/g,'&#39;')}')">🔑 تعیین رمز جدید</button>`:''}
+        <button class="iconbtn" onclick="markMsgHandled('${m.id}',${!m.handled})">${m.handled?'↩︎ بازگردانی':'✓ رسیدگی شد'}</button>
+        <button class="iconbtn" onclick="deleteAdminMsg('${m.id}')">🗑 حذف</button>
+      </div></div>`).join('') || '<p class="mutedNote">پیامی نیست.</p>'}
+    <div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end"><button class="ghost" onclick="$('#adminBtn').click()">← مدیریت</button><button class="ghost" onclick="closeModal()">بستن</button></div>`);
+}
+async function markMsgHandled(id, val){ await api(`/api/admin-messages/${id}/handled`, { method:'POST', body:{ handled: val } }).catch(e=>alert(e.message)); openInbox(); }
+async function deleteAdminMsg(id){ if(!confirm('این پیام حذف شود؟')) return; await api(`/api/admin-messages/${id}`, { method:'DELETE' }).catch(e=>alert(e.message)); openInbox(); }
+function updatePendingBadge(n){ if(typeof n==='number') pendingMembers = n; refreshAdminBadge(); }
+function refreshAdminBadge(){
   const btn = $('#adminBtn'); if(!btn) return;
   const existing = btn.querySelector('.badge'); if(existing) existing.remove();
-  if(n>0) btn.insertAdjacentHTML('beforeend', ` <span class="badge">${n}</span>`);
+  const t = pendingMembers + pendingMsgs;
+  if(t>0) btn.insertAdjacentHTML('beforeend', ` <span class="badge">${t}</span>`);
 }
 
 // ---------------- private conversations (inline in the main area) ----------------
@@ -721,11 +834,11 @@ function chatRowHtml(m){
   const mine = m.from===me.id;
   const canSpeak = !!(window.speechSynthesis && m.text);
   return `<div class="msg ${mine?'mine':''}">
-    <div class="meta">${avatar(m.fromName)}<b>${esc(m.fromName)}</b> <span>${fmtTime(m.time)}</span></div>
+    <div class="meta">${avatar(m.fromName)}<b>${esc(m.fromName)}</b> <span>${fmtTime(m.time)}</span>${m.edited?'<span class="editedTag">(ویرایش‌شده)</span>':''}</div>
     ${m.text?`<div>${esc(m.text)}</div>`:''}
     ${attachHtml(m.attachment)}
     <div class="actions">
-      ${(mine && !convReadOnly)?`<span onclick="delChatMsg('${m.id}')">حذف</span>`:''}
+      ${(mine && !convReadOnly)?`<span onclick="editMsg('${m.id}','chat')">✏️ ویرایش</span><span onclick="delChatMsg('${m.id}')">حذف</span>`:''}
       ${canSpeak?`<span onclick="speakMsgById('${m.id}')">🔊 خواندن</span>`:''}
     </div>
   </div>`;
@@ -839,6 +952,22 @@ function applyTheme(){
   const btn = $('#themeToggleBtn');
   if(btn) btn.textContent = mode==='dark' ? '☀️ حالت روز' : '🌙 حالت شب';
 }
+const FONT_STEPS = [0.9, 1, 1.15, 1.3, 1.5, 1.75];
+function fontIndex(){ const i = parseInt(localStorage.getItem('fontStep'),10); return Number.isInteger(i) && i>=0 && i<FONT_STEPS.length ? i : 1; }
+function applyFont(){
+  document.documentElement.style.fontSize = (16*FONT_STEPS[fontIndex()])+'px';
+  document.querySelectorAll('[data-font]').forEach(b=>{
+    const d = parseInt(b.dataset.font,10), i = fontIndex();
+    b.disabled = (d<0 && i===0) || (d>0 && i===FONT_STEPS.length-1);
+  });
+}
+function changeFont(d){
+  const i = Math.min(FONT_STEPS.length-1, Math.max(0, fontIndex()+d));
+  localStorage.setItem('fontStep', String(i)); applyFont();
+  try{ toast(`اندازه‌ی نوشته‌ها: ${Math.round(FONT_STEPS[i]*100)}٪`); }catch(e){}
+}
+document.querySelectorAll('[data-font]').forEach(b=>b.onclick=()=>changeFont(parseInt(b.dataset.font,10)));
+applyFont();
 applyTheme();
 $('#themeToggleBtn').onclick = ()=>{
   localStorage.setItem('themeMode', currentMode()==='dark' ? 'light' : 'dark');
@@ -849,7 +978,7 @@ $('#themeColorBtn').onclick = ()=>{
   const sel = parseInt(localStorage.getItem('themePalette')||'0',10);
   openModal(`<h3>رنگ و پس‌زمینه</h3>
     <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:12px">
-      ${PALETTES.map((p,i)=>{ const c = mode==='dark'?p.d:p.l; return `<div onclick="setPalette(${i})" style="cursor:pointer;text-align:center;font-size:12px">
+      ${PALETTES.map((p,i)=>{ const c = mode==='dark'?p.d:p.l; return `<div onclick="setPalette(${i})" style="cursor:pointer;text-align:center;font-size:0.75rem">
         <div style="height:44px;border-radius:10px;background:${c.bg};border:3px solid ${i===sel?c.accent:'var(--line)'};display:flex;align-items:center;justify-content:center"><span style="width:18px;height:18px;border-radius:50%;background:${c.accent}"></span></div>${p.n}</div>`; }).join('')}
     </div>
     <div style="text-align:left"><button class="ghost" onclick="closeModal()">بستن</button></div>`);

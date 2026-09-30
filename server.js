@@ -5,11 +5,13 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const { v4: uuid } = require('uuid');
+const crypto = require('crypto');
 const http = require('http');
 const { Server } = require('socket.io');
 const db = require('./db');
 
 const app = express();
+app.set('trust proxy', 1);
 const server = http.createServer(app);
 const io = new Server(server);
 
@@ -235,7 +237,21 @@ app.post('/api/auth/register', (req, res) => {
 });
 
 // ---------- forgot / reset password ----------
+// what the login screen needs to know, without logging in
+function effectiveRecoveryMethod() {
+  const m = readSettings().recoveryMethod;
+  return (m !== 'admin' && mailTransport) ? m : 'admin';
+}
+app.get('/api/public/recovery-info', (req, res) => {
+  const first = db.get('users').first().value();
+  res.json({
+    method: effectiveRecoveryMethod(),
+    contact: first ? { displayName: first.displayName, phone: first.phone || '' } : null
+  });
+});
+
 app.post('/api/auth/forgot', (req, res) => {
+  if (effectiveRecoveryMethod() === 'admin') return res.status(400).json({ error: 'بازیابی رمز فعلاً از طریق مدیر انجام می‌شود. از بخش «ارتباط با مدیر» کمک بگیرید.' });
   const identifier = String((req.body || {}).identifier || '').trim();
   const generic = { ok: true, message: 'اگر چنین حسابی وجود داشته باشد، ایمیل بازیابی برایش ارسال شد. اگر ایمیلی ثبت نکرده‌اید یا ایمیل نرسید، از بخش «ارتباط با مدیر» کمک بگیرید.' };
   if (!identifier) return res.json(generic);
@@ -289,6 +305,63 @@ app.get('/api/public/admin-contact', (req, res) => {
   const first = db.get('users').first().value();
   if (!first) return res.json({ contact: null });
   res.json({ contact: { displayName: first.displayName, phone: first.phone || '' } });
+});
+
+// ---------- message to the main admin (works without logging in) ----------
+// Abuse protection: honeypot field, minimum fill-in time, length limits, and per-IP / per-username / global caps.
+function ipHash(req) { return crypto.createHash('sha256').update(String(req.ip) + SESSION_SECRET).digest('hex').slice(0, 16); }
+app.post('/api/public/contact-admin', (req, res) => {
+  const b = req.body || {};
+  if (b.website) return res.json({ ok: true });                                   // honeypot: bots fill hidden fields — pretend success
+  if (typeof b.elapsed === 'number' && b.elapsed < 1500) return res.status(400).json({ error: 'لطفاً پیام را کامل بنویسید و دوباره بفرستید.' });
+  const me = currentUser(req);
+  const name = me ? me.displayName : String(b.name || '').trim().slice(0, 60);
+  const username = me ? me.username : String(b.username || '').trim().slice(0, 40);
+  const contact = String(b.contact || (me && me.phone) || '').trim().slice(0, 60);
+  const text = String(b.text || '').trim();
+  if (!name && !username) return res.status(400).json({ error: 'نام یا نام کاربری خود را بنویسید تا مدیر بداند پیام از کیست.' });
+  if (text.length < 5) return res.status(400).json({ error: 'پیام خیلی کوتاه است.' });
+  if (text.length > 500) return res.status(400).json({ error: 'پیام حداکثر ۵۰۰ کاراکتر باشد.' });
+  const now = Date.now(), ih = ipHash(req);
+  const all = db.get('adminMessages').value();
+  const mine = all.filter(m => m.ip === ih);
+  if (mine.filter(m => now - m.time < 3600e3).length >= 3 || mine.filter(m => now - m.time < 86400e3).length >= 8)
+    return res.status(429).json({ error: 'تعداد پیام‌های شما از این دستگاه زیاد شده. کمی بعد دوباره امتحان کنید یا مستقیم با مدیر تماس بگیرید.' });
+  if (mine.some(m => m.text === text && now - m.time < 3600e3)) return res.status(429).json({ error: 'همین پیام را قبلاً فرستاده‌اید. مدیر به‌زودی می‌بیند.' });
+  const uname = username.toLowerCase();
+  if (uname && all.filter(m => !m.handled && (m.username || '').toLowerCase() === uname).length >= 3)
+    return res.status(429).json({ error: 'برای این نام کاربری چند پیام رسیدگی‌نشده هست. لطفاً منتظر پاسخ مدیر بمانید.' });
+  if (all.filter(m => !m.handled).length >= 300) return res.status(503).json({ error: 'صندوق پیام مدیر فعلاً پر است. لطفاً تماس تلفنی بگیرید.' });
+  const matched = uname ? db.get('users').find(u => u.username.toLowerCase() === uname).value() : null;
+  const msg = { id: uuid(), name, username, contact, text, time: now, ip: ih, handled: false, userId: matched ? matched.id : null, loggedIn: !!me };
+  db.get('adminMessages').push(msg).write();
+  // keep the file small: past 500 messages, drop the oldest already-handled ones
+  const list = db.get('adminMessages').value();
+  if (list.length > 500) {
+    const drop = list.filter(m => m.handled).sort((a, b) => a.time - b.time).slice(0, list.length - 500).map(m => m.id);
+    if (drop.length) db.get('adminMessages').remove(m => drop.includes(m.id)).write();
+  }
+  io.to('owner').emit('adminMessage', { id: msg.id, name: msg.name || msg.username });
+  res.json({ ok: true });
+});
+
+function adminMsgView(m) { const { ip, ...rest } = m; return rest; }
+app.get('/api/admin-messages', requireAuth, (req, res) => {
+  if (!isOwnerUser(req.user)) return res.status(403).json({ error: 'دسترسی غیرمجاز' });
+  const list = db.get('adminMessages').value().slice().sort((a, b) => b.time - a.time).map(adminMsgView);
+  res.json({ messages: list, unhandled: list.filter(m => !m.handled).length });
+});
+app.post('/api/admin-messages/:id/handled', requireAuth, (req, res) => {
+  if (!isOwnerUser(req.user)) return res.status(403).json({ error: 'دسترسی غیرمجاز' });
+  const m = db.get('adminMessages').find({ id: req.params.id });
+  if (!m.value()) return res.status(404).json({ error: 'پیام پیدا نشد' });
+  m.assign({ handled: !!(req.body || {}).handled }).write();
+  res.json({ ok: true });
+});
+app.delete('/api/admin-messages/:id', requireAuth, (req, res) => {
+  if (!isOwnerUser(req.user)) return res.status(403).json({ error: 'دسترسی غیرمجاز' });
+  db.get('adminMessages').remove({ id: req.params.id }).write();
+  res.json({ ok: true });
 });
 
 app.patch('/api/me', requireAuth, (req, res) => {
@@ -396,16 +469,21 @@ function emitPendingCount() {
 }
 
 // ---------- site settings (chosen by the main admin) ----------
-const SETTING_DEFAULTS = { topicOpenMode: 'scroll' };   // 'scroll' = jump to content, 'page' = separate page on phones
+const SETTING_DEFAULTS = { topicOpenMode: 'scroll', recoveryMethod: 'admin' };   // recoveryMethod: 'admin' | 'email' | 'both'   // 'scroll' = jump to content, 'page' = separate page on phones
 function readSettings() {
   const st = (db.get('meta').value() || {}).settings || {};
   return { ...SETTING_DEFAULTS, ...st };
 }
-app.get('/api/settings', requireAuth, (req, res) => res.json({ settings: readSettings() }));
+app.get('/api/settings', requireAuth, (req, res) => res.json({ settings: readSettings(), emailAvailable: !!mailTransport }));
 app.patch('/api/settings', requireAuth, (req, res) => {
   if (!isOwnerUser(req.user)) return res.status(403).json({ error: 'فقط مدیر اصلی سایت می‌تواند تنظیمات را تغییر دهد' });
-  const { topicOpenMode } = req.body || {};
+  const { topicOpenMode, recoveryMethod } = req.body || {};
   const next = readSettings();
+  if (recoveryMethod !== undefined) {
+    if (!['admin', 'email', 'both'].includes(recoveryMethod)) return res.status(400).json({ error: 'مقدار نامعتبر' });
+    if (recoveryMethod !== 'admin' && !mailTransport) return res.status(400).json({ error: 'ارسال ایمیل هنوز روی سرور راه‌اندازی نشده (تنظیمات SMTP در Railway لازم است)، پس فعلاً فقط «تماس با مدیر» قابل انتخاب است.' });
+    next.recoveryMethod = recoveryMethod;
+  }
   if (topicOpenMode !== undefined) {
     if (!['scroll', 'page'].includes(topicOpenMode)) return res.status(400).json({ error: 'مقدار نامعتبر' });
     next.topicOpenMode = topicOpenMode;
@@ -591,7 +669,35 @@ app.post('/api/messages/:id/react', requireAuth, requireRole('admin', 'member'),
   const updated = { ...cur, legacy, reactions, likes: counts.likes, dislikes: counts.dislikes, thanks: counts.thanks };
   m.assign(updated).write();
   io.emit('messageUpdated', updated);
+  if (reactions[req.user.id] === kind && cur.userId !== req.user.id) {           // added or switched (not taken back), and not on your own message
+    const t = db.get('topics').find({ id: cur.topicId }).value();
+    io.to(`user:${cur.userId}`).emit('notify', { kind: 'reaction', topicId: cur.topicId, topicTitle: t ? t.title : '', from: req.user.displayName, icon: { likes: '👍', dislikes: '👎', thanks: '🙏' }[kind], text: (cur.text || '').slice(0, 40) });
+  }
   res.json({ message: updated });
+});
+
+app.get('/api/messages/:id/reactors', requireAuth, (req, res) => {
+  const m = db.get('messages').find({ id: req.params.id }).value();
+  if (!m) return res.status(404).json({ error: 'پیام پیدا نشد' });
+  const out = { likes: [], dislikes: [], thanks: [] };
+  Object.entries(m.reactions || {}).forEach(([uid, k]) => { const u = userById(uid); if (u && out[k]) out[k].push(u.displayName); });
+  const legacy = m.legacy || (m.reactions ? {} : { likes: m.likes || 0, dislikes: m.dislikes || 0, thanks: m.thanks || 0 });
+  res.json({ ...out, unnamed: { likes: legacy.likes || 0, dislikes: legacy.dislikes || 0, thanks: legacy.thanks || 0 } });
+});
+
+// edit your own message (topics)
+app.patch('/api/messages/:id', requireAuth, requireRole('admin', 'member'), (req, res) => {
+  const m = db.get('messages').find({ id: req.params.id });
+  const cur = m.value();
+  if (!cur) return res.status(404).json({ error: 'پیام پیدا نشد' });
+  if (cur.userId !== req.user.id) return res.status(403).json({ error: 'فقط پیام‌های خودتان را می‌توانید ویرایش کنید' });
+  const text = String((req.body || {}).text || '').trim();
+  if (!text && !cur.attachment) return res.status(400).json({ error: 'متن پیام خالی است' });
+  if (text.length > 4000) return res.status(400).json({ error: 'پیام خیلی طولانی است' });
+  if (text === cur.text) return res.json({ message: cur });
+  m.assign({ text, edited: true, editedAt: Date.now() }).write();
+  io.emit('messageUpdated', m.value());
+  res.json({ message: m.value() });
 });
 
 app.post('/api/messages/:id/pin', requireAuth, requireRole('admin'), (req, res) => {
@@ -748,6 +854,20 @@ app.post('/api/convs/:id/messages', requireAuth, requireRole('admin', 'member'),
 });
 
 // delete one of MY OWN messages (permanent)
+app.patch('/api/chatmsg/:id', requireAuth, requireRole('admin', 'member'), (req, res) => {
+  const m = db.get('chatMessages').find({ id: req.params.id });
+  const cur = m.value();
+  if (!cur) return res.status(404).json({ error: 'پیام پیدا نشد' });
+  if (cur.from !== req.user.id) return res.status(403).json({ error: 'فقط پیام‌های خودتان را می‌توانید ویرایش کنید' });
+  const text = String((req.body || {}).text || '').trim();
+  if (!text && !cur.attachment) return res.status(400).json({ error: 'متن پیام خالی است' });
+  if (text.length > 4000) return res.status(400).json({ error: 'پیام خیلی طولانی است' });
+  if (text === cur.text) return res.json({ message: cur });
+  m.assign({ text, edited: true, editedAt: Date.now() }).write();
+  const c = db.get('conversations').find({ id: cur.convId }).value();
+  if (c) convRooms(c).emit('chatMessageUpdated', { msg: m.value() });
+  res.json({ message: m.value() });
+});
 app.delete('/api/chatmsg/:id', requireAuth, (req, res) => {
   const m = db.get('chatMessages').find({ id: req.params.id }).value();
   if (!m) return res.status(404).json({ error: 'پیام پیدا نشد' });
