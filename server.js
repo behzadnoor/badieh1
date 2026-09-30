@@ -146,6 +146,15 @@ db.write();
   db.set('meta.generalSeeded', true).write();
 })();
 
+// mark the general discussion room so it can be shown first and protected from deletion
+(function markGeneralTopic() {
+  const g = db.get('topics').find(t => t.title === 'گفتگوی عمومی' && !t.hallId).value()
+    || db.get('topics').find(t => !t.hallId).value();
+  if (g && !g.general && !db.get('topics').find({ general: true }).value()) {
+    db.get('topics').find({ id: g.id }).assign({ general: true }).write();
+  }
+})();
+
 const PHONE_REGEX = /^(0|\+98|0098)?9\d{9}$/;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -386,6 +395,26 @@ function emitPendingCount() {
   io.to('admins').emit('pendingCount', { count: db.get('users').filter({ role: 'pending' }).size().value() });
 }
 
+// ---------- site settings (chosen by the main admin) ----------
+const SETTING_DEFAULTS = { topicOpenMode: 'scroll' };   // 'scroll' = jump to content, 'page' = separate page on phones
+function readSettings() {
+  const st = (db.get('meta').value() || {}).settings || {};
+  return { ...SETTING_DEFAULTS, ...st };
+}
+app.get('/api/settings', requireAuth, (req, res) => res.json({ settings: readSettings() }));
+app.patch('/api/settings', requireAuth, (req, res) => {
+  if (!isOwnerUser(req.user)) return res.status(403).json({ error: 'فقط مدیر اصلی سایت می‌تواند تنظیمات را تغییر دهد' });
+  const { topicOpenMode } = req.body || {};
+  const next = readSettings();
+  if (topicOpenMode !== undefined) {
+    if (!['scroll', 'page'].includes(topicOpenMode)) return res.status(400).json({ error: 'مقدار نامعتبر' });
+    next.topicOpenMode = topicOpenMode;
+  }
+  db.set('meta.settings', next).write();
+  io.emit('settingsChanged', next);
+  res.json({ settings: next });
+});
+
 // ---------- halls (categories that group several topics/threads) ----------
 app.get('/api/halls', requireAuth, (req, res) => {
   res.json({ halls: db.get('halls').value() });
@@ -432,8 +461,9 @@ function notifyUsers(ids, exceptId, payload) {
 app.post('/api/topics', requireAuth, requireRole('admin'), (req, res) => {
   const { title, description, hallId } = req.body || {};
   if (!title || !title.trim()) return res.status(400).json({ error: 'عنوان لازم است' });
-  if (hallId && !db.get('halls').find({ id: hallId }).value()) return res.status(400).json({ error: 'تالار انتخاب‌شده پیدا نشد' });
-  const topic = { id: uuid(), hallId: hallId || null, title: title.trim().slice(0, 100), description: (description || '').trim().slice(0, 200), pdfFile: null, pdfName: null, createdAt: Date.now() };
+  if (!hallId) return res.status(400).json({ error: 'زیرموضوع باید داخل یک تالار اختصاصی ساخته شود' });
+  if (!db.get('halls').find({ id: hallId }).value()) return res.status(400).json({ error: 'تالار انتخاب‌شده پیدا نشد' });
+  const topic = { id: uuid(), hallId: hallId, title: title.trim().slice(0, 100), description: (description || '').trim().slice(0, 200), pdfFile: null, pdfName: null, createdAt: Date.now() };
   db.get('topics').push(topic).write();
   io.emit('newTopic', topic);
   res.json({ topic });
@@ -449,7 +479,7 @@ app.patch('/api/topics/:id', requireAuth, requireRole('admin'), (req, res) => {
     changes.title = String(title).trim().slice(0, 100);
   }
   if (description !== undefined) changes.description = String(description).trim().slice(0, 200);
-  if (hallId !== undefined) {
+  if (hallId !== undefined && !topic.value().general) {
     if (hallId && !db.get('halls').find({ id: hallId }).value()) return res.status(400).json({ error: 'تالار انتخاب‌شده پیدا نشد' });
     changes.hallId = hallId || null;
   }
@@ -457,6 +487,26 @@ app.patch('/api/topics/:id', requireAuth, requireRole('admin'), (req, res) => {
   io.emit('topicUpdated', topic.value());
   notifyUsers(topicAudience(req.params.id), req.user.id, { kind: 'topic', topicId: req.params.id, topicTitle: topic.value().title, from: req.user.displayName, text: 'عنوان یا توضیح این تالار تغییر کرد' });
   res.json({ topic: topic.value() });
+});
+
+app.delete('/api/topics/:id', requireAuth, requireRole('admin'), (req, res) => {
+  const topic = db.get('topics').find({ id: req.params.id });
+  const t = topic.value();
+  if (!t) return res.status(404).json({ error: 'تاپیک پیدا نشد' });
+  if (t.general) return res.status(400).json({ error: 'گفتگوی عمومی قابل حذف نیست' });
+  const msgs = db.get('messages').filter({ topicId: t.id }).value();
+  msgs.forEach(m => {
+    if (m.attachment && m.attachment.url) {
+      const file = path.basename(m.attachment.url);
+      removeUploadedFile(file);
+      db.get('attachments').remove({ file }).write();
+    }
+  });
+  db.get('messages').remove({ topicId: t.id }).write();
+  if (t.pdfFile) removeUploadedFile(t.pdfFile);
+  db.get('topics').remove({ id: t.id }).write();
+  io.emit('topicDeleted', { id: t.id });
+  res.json({ ok: true, removedMessages: msgs.length });
 });
 
 function removeUploadedFile(name) {
@@ -524,12 +574,21 @@ app.post('/api/topics/:id/messages', requireAuth, requireRole('admin', 'member')
   res.json({ message: msg });
 });
 
-app.post('/api/messages/:id/react', requireAuth, (req, res) => {
+const REACTION_KINDS = ['likes', 'dislikes', 'thanks'];
+app.post('/api/messages/:id/react', requireAuth, requireRole('admin', 'member'), (req, res) => {
   const { kind } = req.body || {};
-  if (!['likes', 'dislikes', 'thanks'].includes(kind)) return res.status(400).json({ error: 'نوع واکنش نامعتبر' });
+  if (!REACTION_KINDS.includes(kind)) return res.status(400).json({ error: 'نوع واکنش نامعتبر' });
   const m = db.get('messages').find({ id: req.params.id });
-  if (!m.value()) return res.status(404).json({ error: 'پیام پیدا نشد' });
-  const updated = { ...m.value(), [kind]: (m.value()[kind] || 0) + 1 };
+  const cur = m.value();
+  if (!cur) return res.status(404).json({ error: 'پیام پیدا نشد' });
+  // reactions: { userId: kind }  — old messages only have plain counters; keep those as a fixed base
+  const legacy = cur.legacy || (cur.reactions ? { likes: 0, dislikes: 0, thanks: 0 } : { likes: cur.likes || 0, dislikes: cur.dislikes || 0, thanks: cur.thanks || 0 });
+  const reactions = { ...(cur.reactions || {}) };
+  if (reactions[req.user.id] === kind) delete reactions[req.user.id];   // same one again = take it back
+  else reactions[req.user.id] = kind;                                    // new or switched
+  const counts = { ...legacy };
+  Object.values(reactions).forEach(k => { counts[k] = (counts[k] || 0) + 1; });
+  const updated = { ...cur, legacy, reactions, likes: counts.likes, dislikes: counts.dislikes, thanks: counts.thanks };
   m.assign(updated).write();
   io.emit('messageUpdated', updated);
   res.json({ message: updated });
@@ -556,10 +615,30 @@ app.delete('/api/messages/:id', requireAuth, (req, res) => {
 });
 
 // ---------- search ----------
+// Persian text is typed with many look-alike characters (Arabic ي/ك, ZWNJ, digits, diacritics),
+// so both the query and the messages are normalised before comparing.
+function normFa(s) {
+  return String(s || '')
+    .replace(/[\u064A\u0649]/g, '\u06CC')          // ي ى -> ی
+    .replace(/\u0643/g, '\u06A9')                   // ك -> ک
+    .replace(/[\u0629]/g, '\u06C1')                 // ة -> ه (close enough for search)
+    .replace(/[\u0622\u0623\u0625]/g, '\u0627')     // آ أ إ -> ا
+    .replace(/[\u064B-\u065F\u0670\u0640\u200C\u200D]/g, '') // diacritics, tatweel, ZWNJ
+    .replace(/[\u06F0-\u06F9]/g, d => String(d.charCodeAt(0) - 0x06F0))
+    .replace(/[\u0660-\u0669]/g, d => String(d.charCodeAt(0) - 0x0660))
+    .toLowerCase();
+}
 app.get('/api/search', requireAuth, (req, res) => {
-  const q = (req.query.q || '').trim();
+  const q = normFa((req.query.q || '').trim());
   if (!q) return res.json({ results: [] });
-  const results = db.get('messages').filter(m => m.text.includes(q)).value();
+  const words = q.split(/\s+/).filter(Boolean);
+  const topicTitle = {};
+  db.get('topics').value().forEach(t => { topicTitle[t.id] = t.title; });
+  const results = db.get('messages').value()
+    .filter(m => m.text && topicTitle[m.topicId] && words.every(w => normFa(m.text).includes(w)))
+    .sort((a, b) => b.time - a.time)
+    .slice(0, 60)
+    .map(m => ({ id: m.id, topicId: m.topicId, topicTitle: topicTitle[m.topicId], authorName: m.authorName, time: m.time, snippet: m.text.slice(0, 160) }));
   res.json({ results });
 });
 

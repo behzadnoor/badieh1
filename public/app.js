@@ -10,7 +10,10 @@ let convs = [], allConvs = [], currentConv = null, convReadOnly = false, convMsg
 const unread = {};
 let pendingAtt = null;       // {id, kind, name, url} staged for the topic composer
 let pendingChatAtt = null;   // same, for the chat composer
-let recognizer = null, recognizerTarget = null;
+let settings = { topicOpenMode: 'scroll' };
+let searchQuery = '', searchTimer = null;
+let mobileView = 'content';   // only matters in "separate page" mode on phones: 'list' | 'content'
+const isNarrow = () => window.matchMedia('(max-width:1000px)').matches;
 
 const $ = (sel) => document.querySelector(sel);
 function esc(s){ const d=document.createElement('div'); d.textContent=s==null?'':s; return d.innerHTML; }
@@ -112,11 +115,38 @@ function startApp(user){
   $('#authScreen').style.display='none';
   $('#appScreen').style.display='block';
   $('#whoami').textContent = `${me.displayName} (${roleLabel(me.role)})`;
-  if(me.role==='admin'){ $('#newTopicBtn').style.display='inline-block'; $('#newHallBtn').style.display='inline-block'; $('#adminBtn').style.display='inline-block'; api('/api/pending-count').then(d=>updatePendingBadge(d.count)).catch(()=>{}); }
+  if(me.role==='admin'){ $('#newHallBtn').style.display='inline-block'; $('#adminBtn').style.display='inline-block'; api('/api/pending-count').then(d=>updatePendingBadge(d.count)).catch(()=>{}); }
   connectSocket();
   loadHalls();
-  loadTopics().then(()=>jumpToMsgFromUrl());
+  loadSettings().then(()=>loadTopics()).then(()=>jumpToMsgFromUrl());
   loadConvs();
+}
+
+// ---------------- site settings + how a topic opens on phones ----------------
+async function loadSettings(){
+  try{ settings = (await api('/api/settings')).settings; }catch(e){}
+  applyViewMode();
+}
+function applyViewMode(){
+  const page = settings.topicOpenMode==='page' && isNarrow();
+  document.body.classList.toggle('pm', page);
+  document.body.classList.toggle('pm-content', page && mobileView==='content');
+  document.body.classList.toggle('pm-list', page && mobileView==='list');
+}
+window.addEventListener('resize', applyViewMode);
+function showList(){ mobileView='list'; applyViewMode(); window.scrollTo(0,0); }
+function backBtnHtml(){ return `<button type="button" class="ghost backBtn" onclick="showList()">→ بازگشت به فهرست تالارها</button>`; }
+// make it obvious that something opened: jump to it (phones) and flash it briefly
+function revealMain(){
+  if(!isNarrow()) return;
+  const el = $('#mainArea');
+  if(document.body.classList.contains('pm')) window.scrollTo(0,0);
+  else if(el.scrollIntoView) el.scrollIntoView({behavior:'smooth', block:'start'});
+  el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');
+}
+async function saveSetting(key, value){
+  try{ await api('/api/settings', { method:'PATCH', body:{ [key]: value } }); toast('✅ تنظیمات ذخیره شد'); }
+  catch(e){ alert(e.message); }
 }
 function roleLabel(r){ return {admin:'مدیر', member:'عضو', pending:'در انتظار تایید', blocked:'مسدود'}[r] || r; }
 function canWrite(){ return me && (me.role==='admin' || me.role==='member'); }
@@ -148,6 +178,15 @@ function connectSocket(){
   socket.on('newMember', (n)=>{ toast(`🆕 عضو جدید: ${n.displayName} — منتظر تایید`); });
   socket.on('pendingCount', ({count})=> updatePendingBadge(count));
   socket.on('hallsChanged', ()=> loadHalls());
+  socket.on('settingsChanged', (st)=>{ settings = st; applyViewMode(); });
+  socket.on('topicDeleted', ({id})=>{
+    topics = topics.filter(x=>x.id!==id);
+    if(currentTopic===id){
+      currentTopic = null; messages = []; closeModal();
+      const g = topics.find(t=>t.general) || topics[0];
+      if(g) selectTopic(g.id); else { renderTopics(); renderMain(); }
+    } else renderTopics();
+  });
   socket.on('notify', (n)=>{
     const icon = n.kind==='reply' ? '↩️' : (n.kind==='topic' ? '📌' : '💬');
     toast(`${icon} ${esc(n.from)} — ${esc(n.topicTitle||'')}${n.text?': '+esc(n.text):''}`);
@@ -159,13 +198,18 @@ async function loadTopics(){
   const { topics: t } = await api('/api/topics');
   topics = t;
   renderTopics();
-  if(topics[0]) await selectTopic(topics[0].id);
+  const first = topics.find(t=>t.general) || topics[0];
+  if(!first) return;
+  if(settings.topicOpenMode==='page' && isNarrow()){ mobileView='list'; applyViewMode(); }
+  else await selectTopic(first.id);
 }
 function topicItemHtml(t){
-  return `<div class="topic ${t.id===currentTopic?'active':''}" data-id="${t.id}">${esc(t.title)}${t.pdfFile?' 📎':''}</div>`;
+  const admin = me && me.role==='admin';
+  const tools = admin ? `<span class="topicTools"><span class="iconbtn hsm" title="ویرایش" onclick="event.stopPropagation();editTopic('${t.id}')">✏️</span>${t.general?'':`<span class="iconbtn hsm" title="حذف" onclick="event.stopPropagation();deleteTopic('${t.id}')">🗑</span>`}</span>` : '';
+  return `<div class="topic hasTools ${t.id===currentTopic?'active':''}" data-id="${t.id}"><span class="topicName">${t.general?'🏛️ ':''}${esc(t.title)}${t.pdfFile?' 📎':''}</span>${tools}</div>`;
 }
 function renderTopics(){
-  const standalone = topics.filter(t=>!t.hallId);
+  const standalone = topics.filter(t=>!t.hallId).sort((a,b)=>(b.general?1:0)-(a.general?1:0));
   let html = standalone.map(topicItemHtml).join('');
   html += halls.map(h=>{
     const kids = topics.filter(t=>t.hallId===h.id);
@@ -175,7 +219,7 @@ function renderTopics(){
     </div>`;
   }).join('');
   $('#topicList').innerHTML = html || '<p style="font-size:12px;color:var(--muted)">هنوز اتاقی نیست.</p>';
-  document.querySelectorAll('.topic').forEach(el=>el.onclick=()=>selectTopic(el.dataset.id));
+  document.querySelectorAll('#topicList .topic').forEach(el=>el.onclick=()=>selectTopic(el.dataset.id,{reveal:true}));
 }
 async function loadHalls(){ try{ const { halls: h } = await api('/api/halls'); halls = h; renderTopics(); }catch(e){} }
 $('#newHallBtn') && ($('#newHallBtn').onclick = async ()=>{
@@ -191,16 +235,14 @@ async function editHall(id){
   const title = prompt('عنوان تالار:', h.title); if(!title) return;
   try{ await api(`/api/halls/${id}`, { method:'PATCH', body:{ title } }); }catch(e){ alert(e.message); }
 }
-async function selectTopic(id){
+async function selectTopic(id, opts={}){
+  clearSearch();
   currentTopic = id; currentConv = null; convReadOnly = false; renderTopics(); renderConvLists(); replyTo=null;
+  mobileView='content'; applyViewMode();
   const { messages: m } = await api(`/api/topics/${id}/messages`);
   messages = m; renderMain();
+  if(opts.reveal) revealMain();
 }
-$('#newTopicBtn').onclick = async ()=>{
-  const title = prompt('عنوان تاپیک جدید:'); if(!title) return;
-  const { topic } = await api('/api/topics', { method:'POST', body:{ title } });
-  selectTopic(topic.id);
-};
 
 // ---------------- messages ----------------
 function attachHtml(a){
@@ -210,30 +252,30 @@ function attachHtml(a){
 }
 function msgRowHtml(m, ref, extraActions){
   const canSpeak = !!(window.speechSynthesis && m.text);
+  const mineRx = (m.reactions||{})[me.id];
+  const rx = (kind, icon, n)=>`<span class="rx ${mineRx===kind?'mine':''}" onclick="react('${m.id}','${kind}')">${icon} ${n||0}</span>`;
   return `<div class="msg ${m.pinned?'pinned':''}" id="m_${m.id}">
       <div class="meta">${avatar(m.authorName)}<b>${esc(m.authorName)}</b> ${m.pinned?'<span class="badge">پین‌شده</span>':''} <span>${fmtTime(m.time)}</span></div>
       ${ref?`<div class="reply-ref">در پاسخ به ${esc(ref.authorName)}: ${esc(ref.text.slice(0,60))}</div>`:''}
       ${m.text?`<div>${esc(m.text)}</div>`:''}
       ${attachHtml(m.attachment)}
       <div class="actions">
-        <span onclick="react('${m.id}','likes')">👍 ${m.likes||0}</span>
-        <span onclick="react('${m.id}','dislikes')">👎 ${m.dislikes||0}</span>
-        <span onclick="react('${m.id}','thanks')">🙏 ${m.thanks||0}</span>
+        ${rx('likes','👍',m.likes)}${rx('dislikes','👎',m.dislikes)}${rx('thanks','🙏',m.thanks)}
         ${canWrite()?`<span onclick="setReply('${m.id}')">پاسخ</span>`:''}
         ${(me.role==='admin'||m.userId===me.id)?`<span onclick="delMsg('${m.id}')">حذف</span>`:''}
         ${me.role==='admin'?`<span onclick="togglePin('${m.id}',${!m.pinned})">${m.pinned?'برداشتن پین':'پین کردن'}</span>`:''}
         <span onclick="shareMsgLink('${m.id}')">🔗 لینک</span>
-        ${canSpeak?`<span onclick="speakText('${esc(m.text).replace(/'/g,"&#39;")}')">🔊 خواندن</span>`:''}
+        ${canSpeak?`<span onclick="speakMsgById('${m.id}')">🔊 خواندن</span>`:''}
       </div>
     </div>`;
 }
-function renderMain(filter){
+function renderMain(){
+  if(searchQuery) return;   // search results are on screen; they are replaced when the search is closed
   if(currentConv){ renderChat(); return; }
   const t = topics.find(x=>x.id===currentTopic);
-  if(!t){ $('#mainArea').innerHTML='<div class="welcome"><h2>🌵 به راه بادیه مجازی خوش آمدید</h2><p>فضایی برای گفتگو، تبادل نظر و اشتراک‌گذاری دانش<br>در مسیر بی‌انتهای بیابان اندیشه</p><p>یک تالار را انتخاب کنید یا از فهرست اعضای آنلاین، گفتگوی خصوصی شروع کنید.</p></div>'; return; }
-  let list = filter ? messages.filter(m=>m.text.includes(filter)) : messages;
-  list = [...list].sort((a,b)=> (b.pinned?1:0)-(a.pinned?1:0) || a.time-b.time);
-  let html = `<div class="topicHead"><h2>${esc(t.title)}</h2>${me.role==='admin'?`<button class="iconbtn" onclick="editTopic('${t.id}')">✏️ ویرایش تالار</button>`:''}</div>`;
+  if(!t){ $('#mainArea').innerHTML=backBtnHtml()+'<div class="welcome"><h2>🌵 به راه بادیه مجازی خوش آمدید</h2><p>فضایی برای گفتگو، تبادل نظر و اشتراک‌گذاری دانش<br>در مسیر بی‌انتهای بیابان اندیشه</p><p>یک تالار را انتخاب کنید یا از فهرست اعضای آنلاین، گفتگوی خصوصی شروع کنید.</p></div>'; return; }
+  let list = [...messages].sort((a,b)=> (b.pinned?1:0)-(a.pinned?1:0) || a.time-b.time);
+  let html = backBtnHtml() + `<div class="topicHead"><h2>${esc(t.title)}</h2>${me.role==='admin'?`<button class="iconbtn" onclick="editTopic('${t.id}')">✏️ ویرایش</button>${t.general?'':`<button class="iconbtn" onclick="deleteTopic('${t.id}')">🗑 حذف</button>`}`:''}</div>`;
   if(t.description) html += `<p class="mutedNote">${esc(t.description)}</p>`;
   if(t.pdfFile) html += `<p>📎 <a href="/uploads/${t.pdfFile}" target="_blank">${esc(t.pdfName||'فایل PDF')}</a>${me.role==='admin'?` <span class="iconbtn" style="cursor:pointer" onclick="deleteTopicPdf('${t.id}')">🗑 حذف فایل</span>`:''}</p>`;
   if(me.role==='admin') html += `<p><label class="iconbtn" style="cursor:pointer">📎 ${t.pdfFile?'جایگزینی فایل PDF':'بارگذاری فایل PDF'}<input type="file" id="pdfInput" accept="application/pdf" style="display:none"></label></p>`;
@@ -249,7 +291,7 @@ function renderMain(filter){
         <textarea id="composerInput" placeholder="پیام خود را بنویسید..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMsg();}"></textarea>
         <div class="composerTools">
           <label class="iconbtn" style="cursor:pointer" title="پیوست عکس یا صدا">📷🎤<input type="file" id="msgAttachInput" accept="image/*,audio/*" style="display:none"></label>
-          <button type="button" class="iconbtn" id="micBtn" onclick="toggleMic('composerInput')" style="display:none" title="گفتار به نوشتار">🎙️</button>
+          <button type="button" class="iconbtn" id="micBtn" style="display:none" title="گفتار به نوشتار">🎙️</button>
           <button onclick="sendMsg()">ارسال</button>
         </div>
       </div>
@@ -264,7 +306,7 @@ function renderMain(filter){
   const attInput = $('#msgAttachInput');
   if(attInput) attInput.onchange = (e)=>stageAttachment(e, 'topic');
   renderAttachPreview();
-  setupMicButton('micBtn','composerInput');
+  setupMicButton('micBtn','topic');
 }
 function setReply(id){ replyTo=id; renderMain(); }
 function clearReply(){ replyTo=null; renderMain(); }
@@ -278,7 +320,10 @@ async function sendMsg(){
     replyTo=null; el.value=''; pendingAtt=null; renderAttachPreview();
   }catch(e){ alert(e.message); }
 }
-async function react(id, kind){ await api(`/api/messages/${id}/react`, { method:'POST', body:{ kind } }); }
+async function react(id, kind){
+  if(!canWrite()){ toast('برای واکنش دادن باید حساب شما توسط مدیر تایید شود'); return; }
+  try{ await api(`/api/messages/${id}/react`, { method:'POST', body:{ kind } }); }catch(e){ toast(e.message); }
+}
 async function togglePin(id, val){ await api(`/api/messages/${id}/pin`, { method:'POST', body:{ pinned: val } }); }
 async function delMsg(id){ if(confirm('حذف شود؟')) await api(`/api/messages/${id}`, { method:'DELETE' }); }
 async function uploadPdf(e){
@@ -296,18 +341,60 @@ async function deleteTopicPdf(id){
 }
 async function editTopic(id){
   const t = topics.find(x=>x.id===id); if(!t) return;
-  openModal(`<h3>ویرایش تالار</h3>
+  const hallPick = t.general ? '' : `<p class="mutedNote">این تاپیک داخل کدام تالار باشد؟</p>
+    <select id="editTopicHall">${t.hallId?'':'<option value="">— بدون تالار —</option>'}${halls.map(h=>`<option value="${h.id}" ${t.hallId===h.id?'selected':''}>${esc(h.title)}</option>`).join('')}</select>`;
+  openModal(`<h3>ویرایش تاپیک</h3>
     <input id="editTopicTitle" value="${esc(t.title)}" placeholder="عنوان">
     <textarea id="editTopicDesc" placeholder="توضیح کوتاه (اختیاری)" style="min-height:70px">${esc(t.description||'')}</textarea>
-    <div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end"><button class="ghost" onclick="closeModal()">انصراف</button><button onclick="saveTopicEdit('${id}')">ذخیره</button></div>`);
+    ${hallPick}
+    <div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap">${t.general?'':`<button class="ghost" style="margin-left:auto" onclick="deleteTopic('${id}')">🗑 حذف تاپیک</button>`}<button class="ghost" onclick="closeModal()">انصراف</button><button onclick="saveTopicEdit('${id}')">ذخیره</button></div>`);
 }
 async function saveTopicEdit(id){
+  const body = { title: $('#editTopicTitle').value, description: $('#editTopicDesc').value };
+  const hallSel = $('#editTopicHall'); if(hallSel) body.hallId = hallSel.value || null;
   try{
-    await api(`/api/topics/${id}`, { method:'PATCH', body:{ title: $('#editTopicTitle').value, description: $('#editTopicDesc').value } });
+    await api(`/api/topics/${id}`, { method:'PATCH', body });
     closeModal();
   }catch(e){ alert(e.message); }
 }
-$('#searchBox').oninput = e=> renderMain(e.target.value.trim());
+async function deleteTopic(id){
+  const t = topics.find(x=>x.id===id); if(!t || t.general) return;
+  if(!confirm(`تاپیک «${t.title}» با همه‌ی پیام‌ها و فایل‌هایش برای همیشه حذف شود؟\nاین کار قابل بازگشت نیست.`)) return;
+  try{ await api(`/api/topics/${id}`, { method:'DELETE' }); closeModal(); }catch(e){ alert(e.message); }
+}
+
+// ---------------- search (all topics, with results list) ----------------
+function fmtDate(ts){ return new Date(ts).toLocaleDateString('fa-IR'); }
+function clearSearch(){ searchQuery=''; clearTimeout(searchTimer); const b=$('#searchBox'); if(b) b.value=''; }
+function leaveSearch(){ clearSearch(); if(currentConv) renderChat(); else renderMain(); }
+$('#searchBox').oninput = (e)=>{
+  clearTimeout(searchTimer);
+  const q = e.target.value.trim();
+  searchTimer = setTimeout(()=>runSearch(q), 350);
+};
+$('#searchBox').onkeydown = (e)=>{ if(e.key==='Enter'){ e.preventDefault(); clearTimeout(searchTimer); runSearch(e.target.value.trim()); } };
+async function runSearch(q){
+  if(!q){ if(searchQuery){ leaveSearch(); } return; }
+  if(q.length<2){ return; }
+  let results = [];
+  try{ results = (await api('/api/search?q='+encodeURIComponent(q))).results; }catch(err){ toast(err.message); return; }
+  if($('#searchBox').value.trim()!==q) return;   // typed something else meanwhile
+  searchQuery = q;
+  mobileView='content'; applyViewMode();
+  $('#mainArea').innerHTML = backBtnHtml() + `<div class="topicHead"><h2>🔍 نتایج جستجو</h2><button class="iconbtn" onclick="leaveSearch()">✕ بستن جستجو</button></div>
+    <p class="mutedNote">«${esc(q)}» — ${results.length ? results.length+' پیام پیدا شد (تازه‌ترین‌ها اول)' : 'پیامی پیدا نشد'}</p>
+    <div>${results.map(r=>`<div class="msg searchHit" onclick="openSearchHit('${r.topicId}','${r.id}')">
+      <div class="meta">${avatar(r.authorName)}<b>${esc(r.authorName)}</b><span>در «${esc(r.topicTitle)}»</span><span>${fmtDate(r.time)}</span></div>
+      <div>${esc(r.snippet)}</div></div>`).join('')}</div>`;
+  revealMain();
+}
+async function openSearchHit(topicId, msgId){
+  await selectTopic(topicId);
+  setTimeout(()=>{
+    const el = document.getElementById('m_'+msgId);
+    if(el){ el.scrollIntoView({behavior:'smooth', block:'center'}); el.classList.add('highlight'); setTimeout(()=>el.classList.remove('highlight'), 2500); }
+  }, 250);
+}
 
 // ---------------- attachments (images / voice notes) ----------------
 async function stageAttachment(e, target){
@@ -335,50 +422,158 @@ function renderAttachPreview(){
   }
 }
 
-// ---------------- voice typing (speech-to-text) + text-to-speech ----------------
-function setupMicButton(btnId, targetId){
+// ---------------- voice typing (speech-to-text): full-screen panel ----------------
+const SR_API = window.SpeechRecognition || window.webkitSpeechRecognition;
+const IS_ANDROID = /Android/i.test(navigator.userAgent);
+const vp = { rec:null, target:'topic', wantOn:false, lastStart:0, gotResult:false, quickFails:0 };
+const VP_ERRORS = {
+  'not-allowed': 'اجازه‌ی استفاده از میکروفون داده نشده. در Chrome روی آیکون کنار آدرس سایت بزنید و میکروفون را روی «اجازه» بگذارید.',
+  'service-not-allowed': 'سرویس تشخیص گفتار روی این دستگاه فعال نیست (تنظیمات اپ Google و Speech Services را بررسی کنید).',
+  'audio-capture': 'میکروفون پیدا نشد یا برنامه‌ی دیگری از آن استفاده می‌کند.',
+  'network': 'اتصال به سرویس تشخیص گفتار گوگل برقرار نشد. اینترنت را بررسی کنید؛ ممکن است این سرویس بدون VPN در دسترس نباشد.',
+  'language-not-supported': 'تشخیص گفتار فارسی روی این دستگاه پشتیبانی نمی‌شود.'
+};
+function setupMicButton(btnId, target){
   const btn = $('#'+btnId); if(!btn) return;
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if(!SR){ btn.style.display='none'; return; }
+  if(!SR_API){ btn.style.display='none'; return; }
   btn.style.display='inline-block';
-  btn.onclick = ()=>toggleMic(targetId, btnId);
+  btn.onclick = ()=>openVoicePanel(target);
 }
-function toggleMic(targetId, btnId){
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if(!SR) return;
-  const btn = btnId ? $('#'+btnId) : null;
-  if(recognizer && recognizerTarget===targetId){ recognizer.stop(); return; }
-  if(recognizer) recognizer.stop();
-  recognizer = new SR();
-  recognizer.lang = 'fa-IR';
-  recognizer.interimResults = false;
-  recognizerTarget = targetId;
-  if(btn) btn.classList.add('on');
-  recognizer.onresult = (ev)=>{
-    const text = Array.from(ev.results).map(r=>r[0].transcript).join(' ');
-    const el = $('#'+targetId); if(el) el.value = (el.value ? el.value+' ' : '') + text;
+function openVoicePanel(target){
+  if(!SR_API){ toast('این مرورگر گفتار به نوشتار را پشتیبانی نمی‌کند (Chrome را امتحان کنید)'); return; }
+  vp.target = target; vp.quickFails = 0;
+  const existing = ($(target==='chat' ? '#chatInput' : '#composerInput') || {}).value || '';   // keep what was already typed
+  $('#modalRoot').innerHTML = `<div class="voice-backdrop"><div class="voicePanel">
+    <h3>🎙️ گفتار به نوشتار</h3>
+    <div class="vpStatus"><span class="vpDot" id="vpDot"></span><span id="vpStatusText"></span></div>
+    <textarea id="vpText" placeholder="هر چه بگویید اینجا نوشته می‌شود. هر وقت خواستید متن را ویرایش کنید."></textarea>
+    <div id="vpInterim" class="vpInterim"></div>
+    <p class="err" id="vpErr"></p>
+    <div class="vpBtns">
+      <button type="button" id="vpToggle" class="vpMain" onclick="vpToggle()">⏹ قطع</button>
+      <button type="button" onclick="vpSend()">ارسال</button>
+      <button type="button" class="ghost" onclick="vpToComposer()">انتقال به کادر پیام</button>
+      <button type="button" class="ghost" onclick="vpCancel()">انصراف</button>
+    </div></div></div>`;
+  $('#vpText').value = existing;
+  vpStart();
+}
+function vpSetState(on){
+  const dot=$('#vpDot'), txt=$('#vpStatusText'), tg=$('#vpToggle'); if(!dot) return;
+  dot.classList.toggle('on', on);
+  txt.textContent = on ? 'در حال گوش دادن… هر وقت تمام شد «قطع» را بزنید' : 'متوقف شد — می‌توانید متن را ویرایش کنید یا دوباره ادامه دهید';
+  tg.textContent = on ? '⏹ قطع' : '🎙️ ادامه';
+}
+function vpShowErr(m){ const e=$('#vpErr'); if(e) e.textContent=m||''; }
+function vpAppend(t){
+  const ta=$('#vpText'); t=(t||'').trim(); if(!ta||!t) return;
+  ta.value = ta.value && !/\s$/.test(ta.value) ? ta.value+' '+t : ta.value+t;
+  ta.scrollTop = ta.scrollHeight;
+}
+function vpStart(){
+  vpShowErr('');
+  const rec = new SR_API();
+  rec.lang = 'fa-IR'; rec.interimResults = true; rec.maxAlternatives = 1;
+  rec.continuous = !IS_ANDROID;            // Chrome on Android duplicates text in continuous mode; there we restart after every phrase instead
+  vp.rec = rec; vp.wantOn = true;
+  rec.onstart = ()=>{ vp.lastStart = Date.now(); vp.gotResult = false; vpSetState(true); };
+  rec.onresult = (ev)=>{
+    let interim = '';
+    for(let i=ev.resultIndex; i<ev.results.length; i++){
+      const r = ev.results[i];
+      if(r.isFinal){ vpAppend(r[0].transcript); vp.gotResult = true; vp.quickFails = 0; }
+      else interim += r[0].transcript;
+    }
+    const el = $('#vpInterim'); if(el) el.textContent = interim;
   };
-  recognizer.onend = ()=>{ if(btn) btn.classList.remove('on'); recognizer=null; };
-  recognizer.onerror = ()=>{ if(btn) btn.classList.remove('on'); recognizer=null; };
-  recognizer.start();
+  rec.onerror = (ev)=>{
+    const msg = VP_ERRORS[ev.error];
+    if(msg){ vp.wantOn = false; vpShowErr(msg); vpSetState(false); }   // real problem: stop and explain
+  };
+  rec.onend = ()=>{
+    const el = $('#vpInterim'); if(el) el.textContent = '';
+    if(!vp.wantOn || vp.rec!==rec){ vpSetState(false); return; }
+    // the browser ended the session by itself (a pause, or Android's one-phrase limit): keep listening
+    const quick = Date.now()-vp.lastStart < 800 && !vp.gotResult;
+    vp.quickFails = quick ? vp.quickFails+1 : 0;
+    if(vp.quickFails >= 4){ vp.wantOn = false; vpShowErr('میکروفون یا سرویس تشخیص گفتار پاسخ نمی‌دهد. کمی بعد دوباره امتحان کنید.'); vpSetState(false); return; }
+    setTimeout(()=>{ if(vp.wantOn && vp.rec===rec){ try{ rec.start(); }catch(e){} } }, 250);
+  };
+  try{ rec.start(); }catch(e){ vpShowErr('شروع میکروفون ممکن نشد. دوباره امتحان کنید.'); vpSetState(false); }
+}
+function vpStop(hard){
+  vp.wantOn = false;
+  const r = vp.rec;
+  try{ if(r) (hard ? r.abort() : r.stop()); }catch(e){}
+}
+function vpToggle(){ if(vp.wantOn) vpStop(false); else vpStart(); }
+function vpCancel(){ vpStop(true); vp.rec=null; closeModal(); }
+function vpFinish(){
+  const text = ($('#vpText').value||'').trim();
+  vpStop(true); vp.rec = null; closeModal();
+  return text;
+}
+function vpToComposer(){
+  const text = vpFinish();
+  const el = $(vp.target==='chat' ? '#chatInput' : '#composerInput');
+  if(el){ el.value = text; el.focus(); }
+}
+async function vpSend(){
+  const text = ($('#vpText').value||'').trim();
+  if(!text){ vpShowErr('متنی برای ارسال نیست'); return; }
+  vpFinish();
+  const el = $(vp.target==='chat' ? '#chatInput' : '#composerInput');
+  if(!el) return;
+  el.value = text;
+  if(vp.target==='chat') sendChat(); else sendMsg();
+}
+
+// ---------------- text-to-speech (🔊) ----------------
+function speakMsgById(id){
+  const m = messages.find(x=>x.id===id) || convMsgs.find(x=>x.id===id);
+  if(m) speakText(m.text);
 }
 function getVoicesAsync(){
   return new Promise(resolve=>{
-    let voices = window.speechSynthesis.getVoices();
-    if(voices.length) return resolve(voices);
-    const timer = setTimeout(()=>resolve(window.speechSynthesis.getVoices()), 600);
-    window.speechSynthesis.onvoiceschanged = ()=>{ clearTimeout(timer); resolve(window.speechSynthesis.getVoices()); };
+    const synth = window.speechSynthesis;
+    const v = synth.getVoices();
+    if(v.length) return resolve(v);
+    const timer = setTimeout(()=>resolve(synth.getVoices()), 800);
+    synth.onvoiceschanged = ()=>{ clearTimeout(timer); resolve(synth.getVoices()); };
   });
 }
+// long texts are read in short pieces: Chrome silently stops long utterances
+function speechChunks(text){
+  const parts = text.replace(/\s+/g,' ').split(/(?<=[.!؟?،؛:\n])\s*/).filter(Boolean);
+  const out = []; let cur = '';
+  parts.forEach(p=>{
+    if((cur+' '+p).length > 170 && cur){ out.push(cur); cur = p; } else cur = cur ? cur+' '+p : p;
+  });
+  if(cur) out.push(cur);
+  return out.flatMap(c=> c.length>220 ? c.match(/.{1,200}(\s|$)/g) : [c]);
+}
+let ttsCurrent = '';
 async function speakText(text){
-  if(!window.speechSynthesis || !text) return;
-  window.speechSynthesis.cancel();
-  const u = new SpeechSynthesisUtterance(text);
+  const synth = window.speechSynthesis;
+  if(!synth || !text) return;
+  if((synth.speaking || synth.pending) && ttsCurrent===text){ synth.cancel(); ttsCurrent=''; return; }   // tap again = stop
+  synth.cancel(); ttsCurrent = text;
   const voices = await getVoicesAsync();
-  const fa = voices.find(v=>v.lang && v.lang.toLowerCase().startsWith('fa'));
-  if(fa){ u.voice = fa; u.lang = fa.lang; }
-  else { console.warn('هیچ صدای فارسی روی این مرورگر/سیستم نصب نیست؛ با صدای پیش‌فرض خوانده می‌شود.'); }
-  window.speechSynthesis.speak(u);
+  const fa = voices.find(v=>v.lang && /^fa/i.test(v.lang.replace('_','-'))) || voices.find(v=>/persian|farsi|فارسی/i.test(v.name||''));
+  let started = false;
+  const chunks = speechChunks(text);
+  setTimeout(()=>{                                   // a short pause after cancel() — Chrome sometimes drops speak() called immediately after it
+    chunks.forEach((c, i)=>{
+      const u = new SpeechSynthesisUtterance(c);
+      u.lang = fa ? fa.lang : 'fa-IR';
+      if(fa) u.voice = fa;
+      u.onstart = ()=>{ started = true; };
+      u.onerror = (ev)=>{ if(ev.error && ev.error!=='canceled' && ev.error!=='interrupted') toast('🔊 خواندن ممکن نشد ('+ev.error+')'); };
+      if(i===chunks.length-1) u.onend = ()=>{ ttsCurrent=''; };
+      synth.speak(u);
+    });
+  }, 150);
+  setTimeout(()=>{ if(!started && !fa) toast('🔊 صدای فارسی روی این دستگاه پیدا نشد، پس خواندن متن فارسی ممکن نیست.'); }, 2500);
 }
 
 // ---------------- profile ----------------
@@ -464,7 +659,12 @@ $('#adminBtn').onclick = async ()=>{
         </select>
         <span class="iconbtn" style="cursor:pointer;font-size:11px" onclick="adminSetPassword('${u.id}','${esc(u.displayName)}')">تعیین رمز جدید</span>
       </span>
-    </div>`).join('')}<div style="margin-top:12px;text-align:left"><button class="ghost" onclick="closeModal()">بستن</button></div>`);
+    </div>`).join('')}${me.isOwner?`<h3 style="margin-top:18px">⚙️ تنظیمات سایت</h3>
+    <p class="mutedNote">نحوه‌ی باز شدن تاپیک روی گوشی:</p>
+    <select onchange="saveSetting('topicOpenMode',this.value)">
+      <option value="scroll" ${settings.topicOpenMode!=='page'?'selected':''}>اسکرول خودکار به محتوا (پیشنهادی)</option>
+      <option value="page" ${settings.topicOpenMode==='page'?'selected':''}>صفحه‌ی جدا با دکمه‌ی بازگشت</option>
+    </select>`:''}<div style="margin-top:12px;text-align:left"><button class="ghost" onclick="closeModal()">بستن</button></div>`);
 };
 async function setRole(id, role){ await api(`/api/users/${id}/role`, { method:'POST', body:{ role } }); $('#adminBtn').click(); }
 async function adminSetPassword(id, name){
@@ -509,10 +709,13 @@ function renderConvLists(){
   } else box.style.display = 'none';
 }
 async function openConv(id, all){
+  clearSearch();
   currentConv = id; convReadOnly = !!all; currentTopic = null; replyTo = null; unread[id] = 0;
+  mobileView='content'; applyViewMode();
   renderTopics(); renderConvLists();
   try{ convMsgs = (await api(`/api/convs/${id}/messages${all?'?all=1':''}`)).messages; }catch(e){ alert(e.message); return; }
-  renderChat(); window.scrollTo(0, document.body.scrollHeight);
+  renderChat();
+  if(isNarrow()) revealMain(); else window.scrollTo(0, document.body.scrollHeight);
 }
 function chatRowHtml(m){
   const mine = m.from===me.id;
@@ -523,16 +726,17 @@ function chatRowHtml(m){
     ${attachHtml(m.attachment)}
     <div class="actions">
       ${(mine && !convReadOnly)?`<span onclick="delChatMsg('${m.id}')">حذف</span>`:''}
-      ${canSpeak?`<span onclick="speakText('${esc(m.text).replace(/'/g,"&#39;")}')">🔊 خواندن</span>`:''}
+      ${canSpeak?`<span onclick="speakMsgById('${m.id}')">🔊 خواندن</span>`:''}
     </div>
   </div>`;
 }
 function renderChat(){
+  if(searchQuery) return;
   const c = (convReadOnly ? allConvs : convs).find(x=>x.id===currentConv);
   if(!c){ $('#mainArea').innerHTML = ''; return; }
   const prev = $('#chatInput') ? $('#chatInput').value : '';
   const names = c.members.map(m=>esc(m.displayName)).join('، ');
-  let html = `<h2>${c.type==='group'?'👥':'💬'} ${convReadOnly ? names : esc(convName(c))}</h2>`;
+  let html = backBtnHtml() + `<h2>${c.type==='group'?'👥':'💬'} ${convReadOnly ? names : esc(convName(c))}</h2>`;
   if(c.type==='group') html += `<p class="mutedNote">اعضا: ${names}</p>`;
   if(convReadOnly) html += `<p class="mutedNote">حالت نظارت مدیر اصلی — فقط خواندنی</p>`;
   html += `<div id="chatList">${convMsgs.map(chatRowHtml).join('') || '<p style="color:var(--muted)">هنوز پیامی نیست.</p>'}</div>`;
@@ -555,7 +759,7 @@ function renderChat(){
   const attInput = $('#chatAttachInput');
   if(attInput) attInput.onchange = (e)=>stageAttachment(e, 'chat');
   renderAttachPreview();
-  setupMicButton('chatMicBtn','chatInput');
+  setupMicButton('chatMicBtn','chat');
 }
 function chatKey(e){ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); sendChat(); } }
 async function sendChat(){

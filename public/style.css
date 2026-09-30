@@ -49,7 +49,7 @@ header button.ghost:hover{background:rgba(255,255,255,.34)}
 .side h3{font-size:16px;color:var(--accent);border-bottom:2px solid var(--accent);padding-bottom:8px;margin:0 0 12px}
 .side h3:not(:first-child){margin-top:22px}
 .side .ghost{width:100%;margin-top:6px;font-size:13px;border-radius:12px}
-.side #newTopicBtn,.side #newConvBtn{background:var(--accent);color:var(--on-accent);border:none;font-weight:bold;padding:10px}
+.side #newConvBtn{background:var(--accent);color:var(--on-accent);border:none;font-weight:bold;padding:10px}
 #onlineList div{font-size:13px;margin-bottom:8px;padding:6px 8px;border-radius:10px}
 #onlineList div[onclick]:hover{background:color-mix(in srgb,var(--accent) 12%,transparent)}
 .dot{width:9px;height:9px;border-radius:50%;background:#3cb043;display:inline-block;margin-left:6px;box-shadow:0 0 0 0 rgba(60,176,67,.6);animation:pulse 2s infinite}
@@ -126,3 +126,46 @@ header button.ghost:hover{background:rgba(255,255,255,.34)}
 .composer textarea{margin:0}
 .composerTools{display:flex;gap:6px;align-items:center;justify-content:flex-start}
 .composerTools button:not(.iconbtn){margin-right:auto}
+
+/* ---- phase 5: bug-fix package ---- */
+/* topics in the sidebar: name + edit/delete icons (admin) */
+.topic.hasTools{display:flex;align-items:center;justify-content:space-between;gap:6px}
+.topicName{flex:1;min-width:0;overflow-wrap:anywhere}
+.topicTools{display:flex;gap:2px;flex-shrink:0}
+.topicTools .iconbtn{border:none;padding:6px 8px;font-size:15px;cursor:pointer}
+
+/* reactions: the one you chose is highlighted */
+.msg .actions span.rx{padding:2px 8px;border-radius:999px;border:1px solid transparent}
+.msg .actions span.rx.mine{color:var(--accent);font-weight:bold;border-color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,transparent)}
+
+/* search results */
+.searchHit{cursor:pointer}
+.searchHit:hover{border-color:var(--accent)}
+
+/* a brief flash so it is obvious where a topic opened */
+#mainArea.flash{animation:mainflash 1.1s ease}
+@keyframes mainflash{0%{box-shadow:0 0 0 4px color-mix(in srgb,var(--accent) 60%,transparent)}100%{box-shadow:var(--shadow)}}
+
+/* "separate page" mode on phones: list and content are two screens */
+.backBtn{display:none;margin-bottom:10px}
+body.pm-content .backBtn{display:inline-block}
+body.pm-content .side{display:none}
+body.pm-list .main{display:none}
+
+/* voice typing panel */
+.voice-backdrop{position:fixed;inset:0;background:rgba(40,25,10,.55);display:flex;align-items:center;justify-content:center;z-index:70}
+.voicePanel{background:var(--card);width:min(680px,100%);height:min(640px,100%);display:flex;flex-direction:column;padding:18px;border-radius:20px;box-shadow:var(--shadow)}
+.voicePanel h3{margin:0 0 8px;color:var(--accent)}
+.vpStatus{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);margin-bottom:8px}
+.vpDot{width:12px;height:12px;border-radius:50%;background:#aaa;flex-shrink:0}
+.vpDot.on{background:#d33;animation:vpPulse 1.2s infinite}
+@keyframes vpPulse{0%{box-shadow:0 0 0 0 rgba(221,51,51,.55)}70%{box-shadow:0 0 0 9px rgba(221,51,51,0)}100%{box-shadow:0 0 0 0 rgba(221,51,51,0)}}
+.voicePanel textarea{flex:1;min-height:120px;font-size:18px;line-height:2;resize:none;margin-bottom:6px}
+.vpInterim{min-height:24px;color:var(--muted);font-size:15px}
+.vpBtns{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+.vpBtns button{flex:1 1 40%;padding:13px 10px;font-size:15px}
+.vpBtns .vpMain{flex-basis:100%;font-size:17px}
+@media (max-width:1000px){
+  .voice-backdrop{align-items:stretch}
+  .voicePanel{width:100%;height:100%;border-radius:0}
+}
