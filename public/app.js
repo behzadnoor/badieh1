@@ -15,6 +15,17 @@ let pendingMembers = 0, pendingMsgs = 0;
 let searchQuery = '', searchTimer = null;
 let mobileView = 'content';   // only matters in "separate page" mode on phones: 'list' | 'content'
 const isNarrow = () => window.matchMedia('(max-width:1000px)').matches;
+const can = (k) => !!(me && me.perms && me.perms[k]);          // permission check (main admin has all)
+const knownAccounts = {};                                      // userId -> {displayName, phone}, filled by the admin panel / inbox
+function fmtDateTime(ts){ return ts ? new Date(ts).toLocaleString('fa-IR',{timeZone:'Asia/Tehran',dateStyle:'short',timeStyle:'short'}) : '—'; }
+function copyText(t){
+  if(navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(t).then(()=>toast('📋 کپی شد')).catch(()=>toast(t));
+  else toast(t);
+}
+function randomPass(){
+  const a = 'abcdefghjkmnpqrstuvwxyzACDEFGHJKLMNPQRTUVWXYZ2346789'; const b = new Uint32Array(8); crypto.getRandomValues(b);
+  return Array.from(b, x=>a[x % a.length]).join('');
+}
 
 const $ = (sel) => document.querySelector(sel);
 function esc(s){ const d=document.createElement('div'); d.textContent=s==null?'':s; return d.innerHTML; }
@@ -31,7 +42,7 @@ async function api(url, opts={}){
     body: opts.body ? JSON.stringify(opts.body) : undefined
   });
   const data = await res.json().catch(()=>({}));
-  if(!res.ok) throw new Error(data.error || 'خطا');
+  if(!res.ok){ if(data.mustChange && me) forcePasswordChange(); throw new Error(data.error || 'خطا'); }
   return data;
 }
 
@@ -71,6 +82,7 @@ async function openForgot(){
   openModal(`<h3>فراموشی رمز عبور</h3>
     <p class="mutedNote">نام کاربری یا ایمیل خود را وارد کنید تا لینک بازیابی برایتان ایمیل شود.</p>
     <input id="forgotId" placeholder="نام کاربری یا ایمیل">
+    <p class="mutedNote"><a href="#" onclick="openOwnerRecover();return false">🛟 مدیر اصلی هستم و کد بازیابی اضطراری دارم</a></p>
     <p class="err" id="forgotErr"></p>
     <p id="forgotMsg" class="mutedNote"></p>
     <div style="display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap"><button class="ghost" style="margin-left:auto" onclick="openContactAdmin(true)">ایمیل ندارم / ایمیل نرسید</button><button class="ghost" onclick="closeModal()">بستن</button><button onclick="submitForgot()">ارسال لینک</button></div>`);
@@ -83,23 +95,22 @@ async function submitForgot(){
     $('#forgotMsg').textContent = message;
   }catch(e){ $('#forgotErr').textContent = e.message; }
 }
-let contactOpenedAt = 0;
 async function openContactAdmin(forgot){
   const { contact: c } = await recoveryInfo();
   const phoneHtml = (c && c.phone)
     ? `<p>تماس تلفنی با ${esc(c.displayName)}:</p><p><a class="phoneLink" href="tel:${esc(c.phone)}">📞 ${esc(c.phone)}</a></p>`
     : `<p class="mutedNote">شماره‌ی تماس مدیر هنوز ثبت نشده.</p>`;
-  contactOpenedAt = Date.now();
   openModal(`<h3>${forgot?'فراموشی رمز عبور — ارتباط با مدیر':'ارتباط با مدیر'}</h3>
     ${forgot?'<p class="mutedNote">برای رمز جدید، مدیر باید هویت شما را تایید کند. یا تماس بگیرید یا پیام بفرستید.</p>':''}
     ${phoneHtml}
     <hr style="border-color:var(--line)">
-    <p class="mutedNote">یا همین‌جا پیام بفرستید (مدیر در سایت می‌بیند):</p>
+    <p class="mutedNote">یا همین‌جا پیام بفرستید (مدیران در سایت می‌بینند). برای امنیت شما، مدیر فقط با <b>شماره‌ای که موقع ثبت‌نام داده‌اید</b> تماس می‌گیرد، نه شماره‌ای که اینجا می‌نویسید.</p>
     <input id="cmName" placeholder="نام شما">
     <input id="cmUser" placeholder="نام کاربری (اگر دارید)" autocapitalize="none" autocomplete="off">
     <input id="cmContact" type="tel" placeholder="شماره‌ی تماس برای پاسخ (اختیاری)">
-    <textarea id="cmText" maxlength="500" placeholder="پیام شما (حداکثر ۵۰۰ کاراکتر)" style="min-height:90px"></textarea>
+    <textarea id="cmText" maxlength="2000" placeholder="پیام شما (حداکثر ۲۰۰۰ کاراکتر)" style="min-height:90px"></textarea>
     <input id="cmWebsite" type="text" tabindex="-1" autocomplete="off" aria-hidden="true" style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0">
+    <p class="mutedNote"><a href="#" onclick="openOwnerRecover();return false">🛟 مدیر اصلی هستم و کد بازیابی اضطراری دارم</a></p>
     <p class="err" id="cmErr"></p><p id="cmOk" class="mutedNote" style="color:var(--accent);font-weight:bold"></p>
     <div style="display:flex;gap:8px;justify-content:flex-end"><button class="ghost" onclick="closeModal()">بستن</button><button id="cmSend" onclick="sendContactAdmin()">ارسال پیام</button></div>`);
 }
@@ -109,11 +120,27 @@ async function sendContactAdmin(){
   try{
     await api('/api/public/contact-admin', { method:'POST', body:{
       name:$('#cmName').value, username:$('#cmUser').value, contact:$('#cmContact').value, text:$('#cmText').value,
-      website:$('#cmWebsite').value, elapsed: Date.now()-contactOpenedAt } });
+      website:$('#cmWebsite').value } });
     $('#cmOk').textContent = '✅ پیام شما برای مدیر فرستاده شد. مدیر پس از بررسی با شما هماهنگ می‌کند.';
     $('#cmText').value='';
   }catch(e){ $('#cmErr').textContent = e.message; btn.disabled=false; return; }
   setTimeout(()=>{ const b=$('#cmSend'); if(b) b.disabled=false; }, 4000);
+}
+function openOwnerRecover(){
+  openModal(`<h3>🛟 بازیابی حساب مدیر اصلی</h3>
+    <p class="mutedNote">نام کاربری مدیر اصلی و «کد بازیابی اضطراری» را وارد کنید (کدی که قبلاً از «تنظیمات سایت» ساخته‌اید).</p>
+    <input id="orUser" placeholder="نام کاربری مدیر اصلی" autocapitalize="none" autocomplete="off">
+    <input id="orCode" placeholder="XXXXX-XXXXX-XXXXX-XXXXX" autocapitalize="characters" autocomplete="off" dir="ltr" style="text-align:left">
+    <input id="orPass" type="password" placeholder="رمز عبور جدید">
+    <input id="orPass2" type="password" placeholder="تکرار رمز جدید">
+    <p class="err" id="orErr"></p>
+    <div style="display:flex;gap:8px;justify-content:flex-end"><button class="ghost" onclick="closeModal()">انصراف</button><button onclick="submitOwnerRecover()">بازیابی و ورود</button></div>`);
+}
+async function submitOwnerRecover(){
+  try{
+    const { user } = await api('/api/auth/owner-recover', { method:'POST', body:{ username:$('#orUser').value.trim(), code:$('#orCode').value, newPassword:$('#orPass').value, confirmPassword:$('#orPass2').value } });
+    closeModal(); startApp(user);
+  }catch(e){ $('#orErr').textContent = e.message; }
 }
 $('#resetForm').onsubmit = async (e)=>{
   e.preventDefault();
@@ -144,12 +171,54 @@ function startApp(user){
   $('#authScreen').style.display='none';
   $('#appScreen').style.display='block';
   $('#whoami').textContent = `${me.displayName} (${roleLabel(me.role)})`;
-  if(me.role==='admin'){ $('#newHallBtn').style.display='inline-block'; $('#adminBtn').style.display='inline-block'; api('/api/pending-count').then(d=>updatePendingBadge(d.count)).catch(()=>{}); if(me.isOwner) api('/api/admin-messages').then(d=>{ pendingMsgs=d.unhandled; refreshAdminBadge(); }).catch(()=>{}); }
+  if(me.mustChangePassword){ forcePasswordChange(); return; }
+  refreshAdminUi();
+  showSecurityNotice();
   connectSocket();
   loadHalls();
   loadSettings().then(()=>loadTopics()).then(()=>jumpToMsgFromUrl());
   loadConvs();
 }
+
+// ---------------- admin abilities (what this admin may see/do) ----------------
+function refreshAdminUi(){
+  const adm = me.role==='admin';
+  $('#newHallBtn').style.display = can('content') ? 'inline-block' : 'none';
+  $('#adminBtn').style.display = (adm && (me.isOwner || can('members') || can('passwords') || can('contact'))) ? 'inline-block' : 'none';
+  if(adm && can('members')) api('/api/pending-count').then(d=>updatePendingBadge(d.count)).catch(()=>{});
+  if(adm && can('contact')) api('/api/admin-messages').then(d=>{ pendingMsgs=d.unhandled; refreshAdminBadge(); }).catch(()=>{});
+  else { pendingMsgs = 0; refreshAdminBadge(); }
+}
+// someone whose password was set by an admin must choose their own before using the site
+function forcePasswordChange(){
+  if(window._forcing) return; window._forcing = true;
+  $('#authScreen').style.display='none'; $('#appScreen').style.display='block';
+  openLockedModal(`<h3>🔐 انتخاب رمز عبور جدید</h3>
+    <p class="mutedNote">رمز حساب شما را مدیر به‌صورت موقت تعیین کرده است. برای ادامه یک رمز دلخواه خودتان انتخاب کنید؛ مدیر هیچ‌وقت آن را نمی‌داند.</p>
+    <input id="fcCur" type="password" placeholder="رمز موقتی که به شما داده شد">
+    <input id="fcNew" type="password" placeholder="رمز جدید (حداقل ۴ کاراکتر)">
+    <input id="fcNew2" type="password" placeholder="تکرار رمز جدید">
+    <p class="err" id="fcErr"></p>
+    <div style="display:flex;gap:8px;justify-content:flex-end"><button class="ghost" onclick="doLogout()">خروج</button><button onclick="submitForcedChange()">ذخیره و ادامه</button></div>`);
+}
+async function submitForcedChange(){
+  try{
+    await api('/api/me', { method:'PATCH', body:{ currentPassword:$('#fcCur').value, newPassword:$('#fcNew').value, confirmPassword:$('#fcNew2').value } });
+    location.reload();
+  }catch(e){ $('#fcErr').textContent = e.message; }
+}
+async function doLogout(){ try{ await api('/api/auth/logout', {method:'POST'}); }catch(e){} location.reload(); }
+
+// a visible heads-up when an admin created a recovery link / temporary password for MY account
+function showSecurityNotice(){
+  const el = $('#secBanner'); if(!el) return;
+  const n = me && me.notice;
+  if(!n){ el.style.display='none'; el.innerHTML=''; return; }
+  const what = n.how==='recovery-link' ? 'لینک بازیابی رمز برای حساب شما ساخت' : 'برای حساب شما رمز موقت تعیین کرد';
+  el.innerHTML = `<b>🔔 اعلان امنیتی:</b> مدیر «${esc(n.by)}» در ${fmtDateTime(n.at)} ${what}. اگر این کار به درخواست خودتان بوده، مشکلی نیست. اگر درخواست نداده‌اید، همین حالا به مدیر اصلی اطلاع دهید. <button type="button" class="ghost" onclick="ackNotice()">متوجه شدم</button>`;
+  el.style.display='block';
+}
+async function ackNotice(){ try{ await api('/api/me/notice-ack', {method:'POST'}); }catch(e){} me.notice = null; showSecurityNotice(); }
 
 // ---------------- site settings + how a topic opens on phones ----------------
 async function loadSettings(){
@@ -216,7 +285,9 @@ function connectSocket(){
       if(g) selectTopic(g.id); else { renderTopics(); renderMain(); }
     } else renderTopics();
   });
-  socket.on('adminMessage', (n)=>{ pendingMsgs++; refreshAdminBadge(); toast(`📨 پیام تازه برای مدیر از ${n.name||'یک کاربر'}`); });
+  socket.on('adminMessage', (n)=>{ if(!can('contact')) return; pendingMsgs++; refreshAdminBadge(); toast(`📨 پیام تازه برای مدیران از ${n.name||'یک کاربر'}`); });
+  socket.on('permsChanged', ({perms})=>{ me.perms = perms; refreshAdminUi(); renderTopics(); if(currentTopic) renderMain(); toast('🔧 دسترسی‌های شما توسط مدیر اصلی تغییر کرد'); });
+  socket.on('securityNotice', (n)=>{ me.notice = n; showSecurityNotice(); });
   socket.on('chatMessageUpdated', ({msg})=>{
     if(msg.convId!==currentConv) return;
     const i = convMsgs.findIndex(x=>x.id===msg.id);
@@ -240,7 +311,7 @@ async function loadTopics(){
   else await selectTopic(first.id);
 }
 function topicItemHtml(t){
-  const admin = me && me.role==='admin';
+  const admin = can('content');
   const tools = admin ? `<span class="topicTools"><span class="iconbtn hsm" title="ویرایش" onclick="event.stopPropagation();editTopic('${t.id}')">✏️</span>${t.general?'':`<span class="iconbtn hsm" title="حذف" onclick="event.stopPropagation();deleteTopic('${t.id}')">🗑</span>`}</span>` : '';
   return `<div class="topic hasTools ${t.id===currentTopic?'active':''}" data-id="${t.id}"><span class="topicName">${t.general?'🏛️ ':''}${esc(t.title)}${t.pdfFile?' 📎':''}</span>${tools}</div>`;
 }
@@ -250,7 +321,7 @@ function renderTopics(){
   html += halls.map(h=>{
     const kids = topics.filter(t=>t.hallId===h.id);
     return `<div class="hallGroup">
-      <div class="hallHead">📁 ${esc(h.title)}${me.role==='admin'?` <span class="iconbtn hsm" onclick="editHall('${h.id}')">✏️</span><span class="iconbtn hsm" onclick="newTopicIn('${h.id}')">＋</span>`:''}</div>
+      <div class="hallHead">📁 ${esc(h.title)}${can('content')?` <span class="iconbtn hsm" onclick="editHall('${h.id}')">✏️</span><span class="iconbtn hsm" onclick="newTopicIn('${h.id}')">＋</span>`:''}</div>
       <div class="hallKids">${kids.map(topicItemHtml).join('') || '<p class="mutedNote" style="margin:2px 10px">هنوز جلسه‌ای نیست.</p>'}</div>
     </div>`;
   }).join('');
@@ -301,8 +372,8 @@ function msgRowHtml(m, ref, extraActions){
         ${anyRx?`<span onclick="showReactors('${m.id}')">👥 چه کسانی؟</span>`:''}
         ${canWrite()?`<span onclick="setReply('${m.id}')">پاسخ</span>`:''}
         ${(canWrite() && m.userId===me.id)?`<span onclick="editMsg('${m.id}','topic')">✏️ ویرایش</span>`:''}
-        ${(me.role==='admin'||m.userId===me.id)?`<span onclick="delMsg('${m.id}')">حذف</span>`:''}
-        ${me.role==='admin'?`<span onclick="togglePin('${m.id}',${!m.pinned})">${m.pinned?'برداشتن پین':'پین کردن'}</span>`:''}
+        ${(can('content')||m.userId===me.id)?`<span onclick="delMsg('${m.id}')">حذف</span>`:''}
+        ${can('content')?`<span onclick="togglePin('${m.id}',${!m.pinned})">${m.pinned?'برداشتن پین':'پین کردن'}</span>`:''}
         <span onclick="shareMsgLink('${m.id}')">🔗 لینک</span>
         ${canSpeak?`<span onclick="speakMsgById('${m.id}')">🔊 خواندن</span>`:''}
       </div>
@@ -314,10 +385,10 @@ function renderMain(){
   const t = topics.find(x=>x.id===currentTopic);
   if(!t){ $('#mainArea').innerHTML=backBtnHtml()+'<div class="welcome"><h2>🌵 به راه بادیه مجازی خوش آمدید</h2><p>فضایی برای گفتگو، تبادل نظر و اشتراک‌گذاری دانش<br>در مسیر بی‌انتهای بیابان اندیشه</p><p>یک تالار را انتخاب کنید یا از فهرست اعضای آنلاین، گفتگوی خصوصی شروع کنید.</p></div>'; return; }
   let list = [...messages].sort((a,b)=> (b.pinned?1:0)-(a.pinned?1:0) || a.time-b.time);
-  let html = backBtnHtml() + `<div class="topicHead"><h2>${esc(t.title)}</h2>${me.role==='admin'?`<button class="iconbtn" onclick="editTopic('${t.id}')">✏️ ویرایش</button>${t.general?'':`<button class="iconbtn" onclick="deleteTopic('${t.id}')">🗑 حذف</button>`}`:''}</div>`;
+  let html = backBtnHtml() + `<div class="topicHead"><h2>${esc(t.title)}</h2>${can('content')?`<button class="iconbtn" onclick="editTopic('${t.id}')">✏️ ویرایش</button>${t.general?'':`<button class="iconbtn" onclick="deleteTopic('${t.id}')">🗑 حذف</button>`}`:''}</div>`;
   if(t.description) html += `<p class="mutedNote">${esc(t.description)}</p>`;
-  if(t.pdfFile) html += `<p>📎 <a href="/uploads/${t.pdfFile}" target="_blank">${esc(t.pdfName||'فایل PDF')}</a>${me.role==='admin'?` <span class="iconbtn" style="cursor:pointer" onclick="deleteTopicPdf('${t.id}')">🗑 حذف فایل</span>`:''}</p>`;
-  if(me.role==='admin') html += `<p><label class="iconbtn" style="cursor:pointer">📎 ${t.pdfFile?'جایگزینی فایل PDF':'بارگذاری فایل PDF'}<input type="file" id="pdfInput" accept="application/pdf" style="display:none"></label></p>`;
+  if(t.pdfFile) html += `<p>📎 <a href="/uploads/${t.pdfFile}" target="_blank">${esc(t.pdfName||'فایل PDF')}</a>${can('content')?` <span class="iconbtn" style="cursor:pointer" onclick="deleteTopicPdf('${t.id}')">🗑 حذف فایل</span>`:''}</p>`;
+  if(can('content')) html += `<p><label class="iconbtn" style="cursor:pointer">📎 ${t.pdfFile?'جایگزینی فایل PDF':'بارگذاری فایل PDF'}<input type="file" id="pdfInput" accept="application/pdf" style="display:none"></label></p>`;
   html += `<div id="msgList">` + (list.map(m=>{
     const ref = m.replyTo ? messages.find(x=>x.id===m.replyTo) : null;
     return msgRowHtml(m, ref);
@@ -455,7 +526,7 @@ $('#searchBox').oninput = (e)=>{
 $('#searchBox').onkeydown = (e)=>{ if(e.key==='Enter'){ e.preventDefault(); clearTimeout(searchTimer); runSearch(e.target.value.trim()); } };
 async function runSearch(q){
   if(!q){ if(searchQuery){ leaveSearch(); } return; }
-  if(q.length<2){ return; }
+  if(q.length<2){ toast('برای جستجو حداقل ۲ حرف بنویسید'); return; }
   let results = [];
   try{ results = (await api('/api/search?q='+encodeURIComponent(q))).results; }catch(err){ toast(err.message); return; }
   if($('#searchBox').value.trim()!==q) return;   // typed something else meanwhile
@@ -724,31 +795,123 @@ function renderOnline(){
 }
 
 // ---------------- modal helper ----------------
-function openModal(html){ $('#modalRoot').innerHTML = `<div class="modal-backdrop" onclick="if(event.target===this) closeModal()"><div class="modal">${html}</div></div>`; }
+function openModal(html, cls){ $('#modalRoot').innerHTML = `<div class="modal-backdrop" onclick="if(event.target===this) closeModal()"><div class="modal ${cls||''}">${html}</div></div>`; enhancePasswordFields($('#modalRoot')); }
+function openLockedModal(html){ $('#modalRoot').innerHTML = `<div class="modal-backdrop"><div class="modal">${html}</div></div>`; enhancePasswordFields($('#modalRoot')); }
+// 👁 button on every password field (for people who mistype — and for older users)
+function enhancePasswordFields(root){
+  (root||document).querySelectorAll('input[type=password]').forEach(inp=>{
+    if(inp.dataset.eye) return; inp.dataset.eye = '1';
+    const wrap = document.createElement('span'); wrap.className = 'pwWrap';
+    inp.parentNode.insertBefore(wrap, inp); wrap.appendChild(inp);
+    const b = document.createElement('button'); b.type = 'button'; b.className = 'pwEye'; b.textContent = '👁'; b.setAttribute('aria-label','نمایش رمز');
+    b.onclick = ()=>{ const show = inp.type==='password'; inp.type = show ? 'text' : 'password'; b.textContent = show ? '🙈' : '👁'; b.setAttribute('aria-label', show ? 'پنهان کردن رمز' : 'نمایش رمز'); };
+    wrap.appendChild(b);
+  });
+}
+enhancePasswordFields(document);
 function closeModal(){ $('#modalRoot').innerHTML=''; }
 
 // ---------------- admin panel ----------------
+let adminUsers = [];
+function canManageUser(u){ return u.id!==me.id && !u.isOwner && (me.isOwner || u.role!=='admin'); }
 $('#adminBtn').onclick = async ()=>{
-  const { users } = await api('/api/users');
-  openModal(`<h3>مدیریت اعضا</h3>${me.isOwner?`<div class="adminTools"><button class="ghost" onclick="openInbox()">📨 صندوق پیام‌ها${pendingMsgs?` <span class="badge">${pendingMsgs}</span>`:''}</button><button class="ghost" onclick="openSettings()">⚙️ تنظیمات سایت</button></div>`:''}${users.map(u=>`
-    <div class="userRow" style="flex-wrap:wrap">
-      <span>${esc(u.displayName)} (${esc(u.username)})${u.realName?` — نام واقعی: ${esc(u.realName)}`:''}${u.phone?` — ${esc(u.phone)}`:''}</span>
-      <span style="display:flex;gap:6px;align-items:center">
-        <select onchange="setRole('${u.id}', this.value)" ${u.id===me.id?'disabled':''}>
-          ${['admin','member','pending','blocked'].map(r=>`<option value="${r}" ${r===u.role?'selected':''}>${roleLabel(r)}</option>`).join('')}
-        </select>
-        <span class="iconbtn" style="cursor:pointer;font-size:0.6875rem" onclick="adminSetPassword('${u.id}','${esc(u.displayName)}')">تعیین رمز جدید</span>
-      </span>
-    </div>`).join('')}<div style="margin-top:12px;text-align:left"><button class="ghost" onclick="closeModal()">بستن</button></div>`);
+  let users;
+  try{ ({ users } = await api('/api/users')); }catch(e){ alert(e.message); return; }
+  adminUsers = users;
+  users.forEach(u=>{ knownAccounts[u.id] = { displayName:u.displayName, phone:u.phone||'' }; });
+  const tools = [
+    can('contact') ? `<button class="ghost" onclick="openInbox()">📨 صندوق پیام‌ها${pendingMsgs?` <span class="badge">${pendingMsgs}</span>`:''}</button>` : '',
+    me.isOwner ? `<button class="ghost" onclick="openLog()">📜 گزارش فعالیت</button><button class="ghost" onclick="openSettings()">⚙️ تنظیمات سایت</button>` : ''
+  ].join('');
+  const rows = users.map(u=>{
+    const manage = canManageUser(u);
+    const roleCtl = (can('members') && manage)
+      ? `<select onchange="setRole('${u.id}', this.value)">${['admin','member','pending','blocked'].filter(r=>me.isOwner||r!=='admin').map(r=>`<option value="${r}" ${r===u.role?'selected':''}>${roleLabel(r)}</option>`).join('')}</select>`
+      : `<span class="roleTag">${u.isOwner?'🛡 مدیر اصلی':roleLabel(u.role)}</span>`;
+    const btns = [
+      (can('passwords') && manage) ? `<span class="iconbtn" onclick="makeRecoveryLink('${u.id}')">🔗 لینک بازیابی</span><span class="iconbtn" onclick="adminSetPassword('${u.id}')">🔑 رمز موقت</span>` : '',
+      (me.isOwner && u.role==='admin' && !u.isOwner) ? `<span class="iconbtn" onclick="openPerms('${u.id}')">🔧 دسترسی‌ها</span>` : ''
+    ].join('');
+    return `<div class="userCard">
+      <div class="userTop"><b>${esc(u.displayName)}</b> <span class="mutedNote">(${esc(u.username)})</span> ${roleCtl}</div>
+      <div class="mutedNote">${u.realName?`نام واقعی: ${esc(u.realName)} · `:''}${u.phone?`📞 <a href="tel:${esc(u.phone)}">${esc(u.phone)}</a> · `:''}${u.email?`${esc(u.email)} · `:''}عضویت: ${fmtDateTime(u.createdAt)} · آخرین ورود: ${fmtDateTime(u.lastLoginAt)}</div>
+      ${btns?`<div class="userBtns">${btns}</div>`:''}
+    </div>`;
+  }).join('');
+  openModal(`<h3>مدیریت اعضا</h3>${tools?`<div class="adminTools">${tools}</div>`:''}${rows}<div style="margin-top:12px;text-align:left"><button class="ghost" onclick="closeModal()">بستن</button></div>`, 'wide');
 };
-async function setRole(id, role){ await api(`/api/users/${id}/role`, { method:'POST', body:{ role } }); $('#adminBtn').click(); }
-async function adminSetPassword(id, name){
-  const np = prompt(`رمز عبور جدید برای ${name}:`); if(!np) return;
-  try{ await api(`/api/users/${id}/set-password`, { method:'POST', body:{ newPassword: np } }); alert('رمز جدید تنظیم شد. آن را به کاربر اطلاع دهید.'); }
-  catch(e){ alert(e.message); }
+async function setRole(id, role){
+  try{ await api(`/api/users/${id}/role`, { method:'POST', body:{ role } }); }catch(e){ alert(e.message); }
+  $('#adminBtn').click();
 }
-function openSettings(){
+
+// which abilities each other admin has (main admin only)
+function openPerms(id){
+  const u = adminUsers.find(x=>x.id===id); if(!u) return;
+  const items = [
+    ['members','تایید، رد و مسدود کردن اعضا'],
+    ['passwords','ساختن رمز موقت و لینک بازیابی برای اعضا'],
+    ['contact','دیدن و رسیدگی به پیام‌های «ارتباط با مدیر»'],
+    ['content','حذف پیام دیگران، پین کردن، مدیریت تالار و تاپیک و فایل‌ها']
+  ];
+  openModal(`<h3>🔧 دسترسی‌های ${esc(u.displayName)}</h3>
+    <p class="mutedNote">هر چه را تیک بزنید این مدیر می‌تواند انجام دهد. هیچ مدیری (حتی با همه‌ی دسترسی‌ها) نمی‌تواند رمز یا نقش مدیر اصلی و مدیرهای دیگر را عوض کند؛ آن فقط با شماست.</p>
+    ${items.map(([k,l])=>`<label class="permRow"><input type="checkbox" id="pm_${k}" ${u.perms && u.perms[k]?'checked':''}> ${l}</label>`).join('')}
+    <p class="err" id="pmErr"></p>
+    <div style="display:flex;gap:8px;justify-content:flex-end"><button class="ghost" onclick="$('#adminBtn').click()">← مدیریت</button><button onclick="savePerms('${id}')">ذخیره</button></div>`);
+}
+async function savePerms(id){
+  const perms = {}; ['members','passwords','contact','content'].forEach(k=>{ perms[k] = $('#pm_'+k).checked; });
+  try{ await api(`/api/users/${id}/perms`, { method:'PATCH', body:{ perms } }); toast('✅ دسترسی‌ها ذخیره شد'); $('#adminBtn').click(); }
+  catch(e){ $('#pmErr').textContent = e.message; }
+}
+
+// temporary password: the person must choose their own at the next login
+function contactBtns(phone, text){
+  if(!phone) return '<p class="mutedNote">شماره‌ی ثبت‌شده‌ای برای این حساب نیست.</p>';
+  return `<p>شماره‌ی <b>ثبت‌شده‌ی</b> این حساب: <a class="phoneLink" href="tel:${esc(phone)}">📞 ${esc(phone)}</a>${text?` <a class="phoneLink" href="sms:${esc(phone)}?&body=${encodeURIComponent(text)}">✉️ پیامک</a>`:''}</p>`;
+}
+function adminSetPassword(id){
+  const k = knownAccounts[id] || { displayName:'', phone:'' };
+  openModal(`<h3>🔑 رمز موقت برای ${esc(k.displayName)}</h3>
+    <p class="mutedNote">این رمز موقتی است: کاربر در اولین ورود مجبور می‌شود رمز دلخواه خودش را انتخاب کند، پس شما هیچ‌وقت رمز نهایی را نمی‌دانید. رمز را فقط به <b>خود همان شخص و از طریق شماره‌ی ثبت‌شده‌ی حسابش</b> بدهید. (روش امن‌تر: «🔗 لینک بازیابی».)</p>
+    ${contactBtns(k.phone)}
+    <input id="tpPass" placeholder="رمز موقت (حداقل ۴ کاراکتر)" autocomplete="off" dir="ltr" style="text-align:left">
+    <div style="margin:4px 0 8px"><button type="button" class="ghost" onclick="$('#tpPass').value=randomPass()">🎲 ساخت رمز تصادفی</button></div>
+    <p class="err" id="tpErr"></p>
+    <div style="display:flex;gap:8px;justify-content:flex-end"><button class="ghost" onclick="closeModal()">انصراف</button><button onclick="submitTempPass('${id}')">تعیین رمز موقت</button></div>`);
+}
+async function submitTempPass(id){
+  const pw = $('#tpPass').value;
+  try{
+    await api(`/api/users/${id}/set-password`, { method:'POST', body:{ newPassword: pw } });
+    const k = knownAccounts[id] || {};
+    openModal(`<h3>✅ رمز موقت تعیین شد</h3>
+      <p>رمز موقت: <span class="codeBox" dir="ltr">${esc(pw)}</span> <button class="ghost" onclick="copyText('${esc(pw)}')">📋 کپی</button></p>
+      ${contactBtns(k.phone, `رمز موقت شما در راه بادیه مجازی: ${pw}`)}
+      <p class="mutedNote">کاربر در اولین ورود باید رمز خودش را انتخاب کند. این اقدام در «گزارش فعالیت» ثبت شد.</p>
+      <div style="text-align:left"><button class="ghost" onclick="closeModal()">بستن</button></div>`);
+  }catch(e){ $('#tpErr').textContent = e.message; }
+}
+
+// one-time recovery link (safest): sent to the REGISTERED phone; the person chooses the password
+async function makeRecoveryLink(id){
+  let r; try{ r = await api(`/api/users/${id}/recovery-link`, { method:'POST', body:{} }); }catch(e){ alert(e.message); return; }
+  const k = knownAccounts[id] || {}; const phone = r.phone || k.phone;
+  openModal(`<h3>🔗 لینک بازیابی برای ${esc(r.displayName)}</h3>
+    <p class="mutedNote">این لینک <b>یک ساعت</b> اعتبار دارد و فقط یک‌بار قابل استفاده است. آن را فقط به شماره‌ی ثبت‌شده‌ی خود این شخص بدهید؛ خودش رمز جدید انتخاب می‌کند.</p>
+    <input id="rlLink" readonly dir="ltr" style="text-align:left" value="${esc(r.link)}" onclick="this.select()">
+    <div style="margin:4px 0 8px"><button class="ghost" onclick="copyText($('#rlLink').value)">📋 کپی لینک</button></div>
+    ${contactBtns(phone, `لینک تعیین رمز جدید (یک ساعت اعتبار): ${r.link}`)}
+    <p class="mutedNote">این اقدام در «گزارش فعالیت» ثبت شد و صاحب حساب هم اعلان می‌بیند.</p>
+    <div style="text-align:left"><button class="ghost" onclick="closeModal()">بستن</button></div>`);
+}
+
+// ---------------- site settings (main admin) ----------------
+async function openSettings(){
   if(!me.isOwner) return;
+  let rc = { exists:false, at:null };
+  try{ rc = await api('/api/owner/recovery-status'); }catch(e){}
   const rm = settings.recoveryMethod || 'admin';
   const dis = emailAvailable ? '' : 'disabled';
   openModal(`<h3>⚙️ تنظیمات سایت</h3>
@@ -764,25 +927,144 @@ function openSettings(){
       <option value="scroll" ${settings.topicOpenMode!=='page'?'selected':''}>اسکرول خودکار به محتوا (پیشنهادی)</option>
       <option value="page" ${settings.topicOpenMode==='page'?'selected':''}>صفحه‌ی جدا با دکمه‌ی بازگشت</option>
     </select>
+    <hr style="border-color:var(--line);margin:16px 0">
+    <h4 style="margin:0 0 4px">🛟 کد بازیابی اضطراری (برای وقتی رمز خودتان را فراموش کردید)</h4>
+    <p class="mutedNote">${rc.exists?`یک کد ساخته شده (${fmtDateTime(rc.at)}). اگر آن را گم کرده‌اید، کد جدید بسازید؛ کد قبلی باطل می‌شود.`:'هنوز کدی نساخته‌اید. همین حالا بسازید و جای امنی یادداشت کنید.'}</p>
+    <button class="ghost" onclick="openRecoveryCodeMaker()">${rc.exists?'ساخت کد جدید':'ساخت کد بازیابی'}</button>
+    <p class="mutedNote" style="margin-top:10px">راه آخر اگر کد را هم ندارید: در Railway (بخش Variables) متغیر <span dir="ltr">OWNER_RESET_PASSWORD</span> را با یک رمز دلخواه (حداقل ۶ کاراکتر) بسازید و سایت را دوباره دیپلوی کنید. رمز مدیر اصلی همان می‌شود. بعد از ورود، حتماً آن متغیر را پاک کنید.</p>
     <div style="margin-top:14px;display:flex;gap:8px;justify-content:flex-end"><button class="ghost" onclick="$('#adminBtn').click()">← مدیریت</button><button class="ghost" onclick="closeModal()">بستن</button></div>`);
 }
+function openRecoveryCodeMaker(){
+  openModal(`<h3>🛟 ساخت کد بازیابی اضطراری</h3>
+    <p class="mutedNote">برای امنیت، رمز عبور فعلی‌تان را وارد کنید.</p>
+    <input id="rcPass" type="password" placeholder="رمز عبور فعلی">
+    <p class="err" id="rcErr"></p>
+    <div style="display:flex;gap:8px;justify-content:flex-end"><button class="ghost" onclick="openSettings()">انصراف</button><button onclick="makeRecoveryCode()">ساخت کد</button></div>`);
+}
+async function makeRecoveryCode(){
+  try{
+    const { code } = await api('/api/owner/recovery-code', { method:'POST', body:{ currentPassword: $('#rcPass').value } });
+    openModal(`<h3>🛟 کد بازیابی شما</h3>
+      <div class="codeBox big" dir="ltr">${esc(code)}</div>
+      <div style="margin:8px 0"><button class="ghost" onclick="copyText('${esc(code)}')">📋 کپی</button></div>
+      <p class="mutedNote"><b>این کد فقط همین یک‌بار نمایش داده می‌شود.</b> آن را روی کاغذ یا جای امنی بنویسید. هر کس این کد و نام کاربری شما را داشته باشد می‌تواند رمز شما را عوض کند. کد یک‌بار مصرف است: بعد از استفاده باید کد جدید بسازید.</p>
+      <div style="text-align:left"><button onclick="openSettings()">نوشتم، بازگشت</button></div>`);
+  }catch(e){ $('#rcErr').textContent = e.message; }
+}
+
+// ---------------- inbox: messages to the admins, with an identity-check card ----------------
 async function openInbox(){
-  if(!me.isOwner) return;
+  if(!can('contact')) return;
   let list = [];
   try{ const d = await api('/api/admin-messages'); list = d.messages; pendingMsgs = d.unhandled; refreshAdminBadge(); }catch(e){ alert(e.message); return; }
+  list.forEach(m=>{ if(m.account) knownAccounts[m.account.id] = { displayName:m.account.displayName, phone:m.account.phone }; });
+  const card = (m)=>{
+    const a = m.account;
+    if(!m.username && !a) return `<div class="verifyCard warn">نام کاربری نوشته نشده؛ حسابی به این پیام وصل نیست.</div>`;
+    if(!a) return `<div class="verifyCard warn">حسابی با نام کاربری «${esc(m.username)}» پیدا نشد.</div>`;
+    const check = a.contactCheck==='match' ? '✅ با شماره‌ی ثبت‌شده یکی است' : a.contactCheck==='mismatch' ? '⚠️ با شماره‌ی ثبت‌شده فرق دارد' : '— (شماره‌ای نوشته نشده)';
+    return `<div class="verifyCard ${a.recentChange||!m.loggedIn?'warn':''}">
+      <b>🔎 مشخصات ثبت‌شده‌ی حساب (از فرم نیست):</b><br>
+      ${esc(a.displayName)} (${esc(a.username)}) · ${roleLabel(a.role)}${a.realName?` · نام واقعی: ${esc(a.realName)}`:''}<br>
+      عضویت: ${fmtDateTime(a.createdAt)} · آخرین ورود: ${fmtDateTime(a.lastLoginAt)}<br>
+      📞 شماره‌ی ثبت‌شده: ${a.phone?`<a class="phoneLink" href="tel:${esc(a.phone)}">${esc(a.phone)}</a>`:'ندارد'}${a.email?` · ${esc(a.email)}`:''}<br>
+      <span class="mutedNote">شماره‌ی نوشته‌شده در پیام: ${esc(m.contact||'—')} ← ${check} (این شماره تایید‌نشده است؛ با آن تماس نگیرید)</span>
+      ${a.recentChange?`<br><b>⚠️ شماره یا ایمیل این حساب در ۱۴ روز اخیر عوض شده. احتیاط کنید.</b>`:''}
+      ${m.loggedIn?'':`<br>⚠️ فرستنده وارد حساب نشده بود؛ هویتش تایید نشده.`}
+    </div>`;
+  };
   openModal(`<h3>📨 صندوق پیام‌ها</h3>
+    <p class="mutedNote">به هیچ پیامی اعتماد نکنید: هر کس می‌تواند نام کاربری دیگری را بنویسد. فقط با <b>شماره‌ی ثبت‌شده‌ی حساب</b> تماس بگیرید و از «🔗 لینک بازیابی» استفاده کنید.</p>
     ${list.map(m=>`<div class="inboxItem ${m.handled?'done':''}">
-      <div class="mutedNote"><b>${esc(m.name||m.username)}</b>${m.username?` (${esc(m.username)})`:''}${m.loggedIn?' ✔️ واردشده':''}${m.contact?` — ${esc(m.contact)}`:''} · ${fmtDate(m.time)} ${fmtTime(m.time)}</div>
+      <div class="mutedNote"><b>${esc(m.name||m.username)}</b>${m.username?` (${esc(m.username)})`:''}${m.loggedIn?' ✔️ واردشده':''} · ${fmtDateTime(m.time)}</div>
       <div style="margin:6px 0;white-space:pre-wrap">${esc(m.text)}</div>
-      <div style="display:flex;gap:6px;flex-wrap:wrap">
-        ${m.userId?`<button class="iconbtn" onclick="adminSetPassword('${m.userId}','${esc(m.name||m.username).replace(/'/g,'&#39;')}')">🔑 تعیین رمز جدید</button>`:''}
+      ${card(m)}
+      ${m.handled?`<div class="mutedNote">✓ رسیدگی شد توسط ${esc(m.handledByName||'؟')} · ${fmtDateTime(m.handledAt)}</div>`:''}
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">
+        ${(m.account && m.account.canRecover)?`<button class="iconbtn" onclick="makeRecoveryLink('${m.account.id}')">🔗 لینک بازیابی (پیشنهادی)</button><button class="iconbtn" onclick="adminSetPassword('${m.account.id}')">🔑 رمز موقت</button>`:''}
         <button class="iconbtn" onclick="markMsgHandled('${m.id}',${!m.handled})">${m.handled?'↩︎ بازگردانی':'✓ رسیدگی شد'}</button>
         <button class="iconbtn" onclick="deleteAdminMsg('${m.id}')">🗑 حذف</button>
       </div></div>`).join('') || '<p class="mutedNote">پیامی نیست.</p>'}
-    <div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end"><button class="ghost" onclick="$('#adminBtn').click()">← مدیریت</button><button class="ghost" onclick="closeModal()">بستن</button></div>`);
+    <div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end"><button class="ghost" onclick="$('#adminBtn').click()">← مدیریت</button><button class="ghost" onclick="closeModal()">بستن</button></div>`, 'wide');
 }
 async function markMsgHandled(id, val){ await api(`/api/admin-messages/${id}/handled`, { method:'POST', body:{ handled: val } }).catch(e=>alert(e.message)); openInbox(); }
 async function deleteAdminMsg(id){ if(!confirm('این پیام حذف شود؟')) return; await api(`/api/admin-messages/${id}`, { method:'DELETE' }).catch(e=>alert(e.message)); openInbox(); }
+
+// ---------------- activity log (main admin) ----------------
+const LOG_CATS = [['','همه‌ی رویدادها'],['auth','ورودها'],['security','امنیت و رمزها'],['members','اعضا و دسترسی‌ها'],['content','محتوا (پیام، تاپیک، فایل)'],['chats','گفتگوهای خصوصی'],['contact','پیام‌ها به مدیر'],['settings','تنظیمات']];
+const LOG_ICON = { auth:'🔓', security:'🔐', members:'👥', content:'📝', chats:'💬', contact:'📨', settings:'⚙️' };
+let logState = { range:'today', from:'', to:'', cat:'', q:'', offset:0, total:0, entries:[], summary:null };
+let logQTimer = null;
+function logQuery(extra){
+  const p = new URLSearchParams();
+  if(logState.from || logState.to){ if(logState.from) p.set('from', logState.from); if(logState.to) p.set('to', logState.to); }
+  else if(logState.range!=='all') p.set('range', logState.range);
+  if(logState.cat) p.set('cat', logState.cat);
+  if(logState.q) p.set('q', logState.q);
+  Object.entries(extra||{}).forEach(([k,v])=>p.set(k,v));
+  return p.toString();
+}
+function openLog(){
+  if(!me.isOwner) return;
+  logState = { range:'today', from:'', to:'', cat:'', q:'', offset:0, total:0, entries:[], summary:null };
+  const chips = [['today','امروز'],['yesterday','دیروز'],['7d','۷ روز اخیر'],['30d','۳۰ روز اخیر'],['all','همه']];
+  openModal(`<h3>📜 گزارش فعالیت <span class="mutedNote">(فقط شما می‌بینید · زمان‌ها به وقت تهران)</span></h3>
+    <div class="logChips" id="logChips">${chips.map(([k,l])=>`<button type="button" class="chip" data-r="${k}" onclick="setLogRange('${k}')">${l}</button>`).join('')}</div>
+    <div class="logFilters">
+      <label>از <input type="date" id="logFrom"></label><label>تا <input type="date" id="logTo"></label>
+      <button type="button" class="ghost" onclick="applyLogDates()">اعمال بازه</button>
+    </div>
+    <div class="logFilters">
+      <select id="logCat" onchange="logState.cat=this.value;loadLog(true)">${LOG_CATS.map(([k,l])=>`<option value="${k}">${l}</option>`).join('')}</select>
+      <input id="logQ" type="search" placeholder="جستجو در گزارش (نام، متن...)" oninput="onLogSearch(this.value)">
+    </div>
+    <div id="logSummary" class="logSummary"></div>
+    <div id="logList"></div>
+    <div id="logMore" style="text-align:center;margin:10px 0"></div>
+    <div style="display:flex;gap:8px;justify-content:space-between;flex-wrap:wrap"><a id="logExport" class="ghost linkbtn" href="#">⬇ خروجی CSV</a><span><button class="ghost" onclick="$('#adminBtn').click()">← مدیریت</button> <button class="ghost" onclick="closeModal()">بستن</button></span></div>`, 'wide');
+  loadLog(true);
+}
+function setLogRange(r){ logState.range = r; logState.from = ''; logState.to = ''; $('#logFrom').value = ''; $('#logTo').value = ''; loadLog(true); }
+function applyLogDates(){ logState.from = $('#logFrom').value; logState.to = $('#logTo').value; if(!logState.from && !logState.to) return; loadLog(true); }
+function onLogSearch(v){ clearTimeout(logQTimer); logQTimer = setTimeout(()=>{ logState.q = v.trim(); loadLog(true); }, 350); }
+async function loadLog(reset){
+  if(reset){ logState.offset = 0; logState.entries = []; }
+  let d; try{ d = await api('/api/logs?'+logQuery({ offset: logState.offset })); }catch(e){ toast(e.message); return; }
+  logState.entries = logState.entries.concat(d.entries); logState.total = d.total; logState.offset = logState.entries.length;
+  if(reset) logState.summary = d.summary;
+  renderLog();
+}
+function logDetailsHtml(e){
+  const d = e.details || {}; let h = '';
+  if(d.old !== undefined) h += `<div class="ld"><b>قبل:</b> ${esc(d.old)}</div><div class="ld"><b>بعد:</b> ${esc(d.new)}</div>`;
+  else if(d.text !== undefined) h += `<div class="ld"><b>متن:</b> ${esc(d.text)}</div>`;
+  if(d.before !== undefined) h += `<div class="ld"><b>قبل:</b> ${esc(d.before)}</div><div class="ld"><b>بعد:</b> ${esc(d.after)}</div>`;
+  if(Array.isArray(d.changes)) h += d.changes.map(c=>`<div class="ld">${esc(c)}</div>`).join('');
+  if(d.attachment) h += `<div class="ld"><b>پیوست:</b> ${esc(d.attachment)}</div>`;
+  if(d.author && d.sentAt) h += `<div class="ld"><b>نویسنده:</b> ${esc(d.author)} · ارسال: ${fmtDateTime(d.sentAt)}</div>`;
+  if(d.contact) h += `<div class="ld"><b>شماره‌ی نوشته‌شده:</b> ${esc(d.contact)} (تایید‌نشده)</div>`;
+  if(d.registeredPhone) h += `<div class="ld"><b>شماره‌ی ثبت‌شده‌ی حساب:</b> ${esc(d.registeredPhone)}</div>`;
+  if(d.description) h += `<div class="ld"><b>توضیح:</b> ${esc(d.description)}</div>`;
+  if(d.pdf) h += `<div class="ld"><b>فایل:</b> ${esc(d.pdf)}</div>`;
+  if(d.messages !== undefined) h += `<div class="ld"><b>تعداد پیام:</b> ${d.messages}</div>`;
+  if(e.ip) h += `<div class="ld">🌐 ${esc(e.ip)} · ${esc(e.device||'')}</div>`;
+  return h;
+}
+function renderLog(){
+  document.querySelectorAll('#logChips .chip').forEach(c=>c.classList.toggle('on', !logState.from && !logState.to && c.dataset.r===logState.range));
+  const sm = logState.summary;
+  if(sm){
+    const cards = [['ورود',sm.logins],['ورود ناموفق',sm.loginFails],['عضو جدید',sm.registrations],['تغییر نقش/دسترسی',sm.roleChanges],['ویرایش',sm.edits],['حذف',sm.deletes],['رویداد امنیتی',sm.security],['پیام به مدیر',sm.contact]];
+    $('#logSummary').innerHTML = cards.map(([l,v])=>`<div class="sumCard"><b>${v}</b><span>${l}</span></div>`).join('');
+  }
+  $('#logList').innerHTML = logState.entries.map(e=>{
+    const det = logDetailsHtml(e);
+    return `<div class="logRow"><div class="logHead"><span>${LOG_ICON[e.cat]||'•'}</span><span class="logTime">${fmtDateTime(e.t)}</span></div><div class="logText">${esc(e.text)}</div>${det?`<details><summary>جزئیات</summary>${det}</details>`:''}</div>`;
+  }).join('') || '<p class="mutedNote">در این بازه رویدادی ثبت نشده.</p>';
+  $('#logMore').innerHTML = logState.entries.length < logState.total ? `<button class="ghost" onclick="loadLog(false)">نمایش بیشتر (${logState.total - logState.entries.length} مورد دیگر)</button>` : (logState.total ? `<span class="mutedNote">${logState.total} رویداد</span>` : '');
+  $('#logExport').href = '/api/logs/export?' + logQuery();
+}
+
 function updatePendingBadge(n){ if(typeof n==='number') pendingMembers = n; refreshAdminBadge(); }
 function refreshAdminBadge(){
   const btn = $('#adminBtn'); if(!btn) return;

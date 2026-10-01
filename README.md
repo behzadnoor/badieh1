@@ -43,3 +43,13 @@ pm2 save
 ## قابلیت‌های نسخه‌ی بعدی (هنوز اضافه نشده)
 - فراخوانی هوش مصنوعی داخل تاپیک برای اظهار نظر روی محتوا
 - ارجاع مستقیم بین تاپیک‌های مختلف با لینک داخلی
+
+## Phase 7 notes (security & admin)
+
+- **Main admin** (first registered user) cannot be blocked, demoted or have the password changed by any other admin. Other admins' roles/passwords can only be changed by the main admin.
+- **Admin permissions** (set per admin by the main admin): members, passwords (members only), contact (inbox), content (halls/topics/files, deleting others' posts).
+- **Recovery**: one-time recovery link (1 hour, sent by the admin to the account's *registered* phone) or a temporary password that the user must change at first login. The account holder sees a security notice afterwards.
+- **Activity log**: stored in `log.jsonl` next to the database (kept 1 year). Visible only to the main admin: "📜 گزارش فعالیت".
+- **Main admin forgot the password**:
+  1. Settings → "کد بازیابی اضطراری" creates a one-time code (write it down). Use "مدیر اصلی هستم و کد بازیابی اضطراری دارم" on the login screen.
+  2. Last resort: set the Railway variable `OWNER_RESET_PASSWORD` (min. 6 chars), redeploy, log in, then **delete the variable**. It applies once per distinct value.

@@ -22,6 +22,53 @@ const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || __dirname;
 const uploadsDir = path.join(DATA_DIR, 'uploads');
 if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir);
 
+// ---------- activity log (append-only file, visible to the main admin only) ----------
+const LOG_FILE = path.join(DATA_DIR, 'log.jsonl');
+const LOG_KEEP_MS = 365 * 24 * 3600 * 1000;      // keep one year
+const TEHRAN_OFFSET = 210 * 60 * 1000;           // Iran has no daylight saving since 2022: UTC+3:30
+const DAY_MS = 86400000;
+function clip(str, n) { str = String(str == null ? '' : str); return str.length > n ? str.slice(0, n) + '…' : str; }
+function deviceOf(req) {
+  const ua = String((req && req.headers && req.headers['user-agent']) || '');
+  const os = /Android/i.test(ua) ? 'Android' : /iPhone|iPad|iOS/i.test(ua) ? 'iOS' : /Windows/i.test(ua) ? 'Windows' : /Mac OS/i.test(ua) ? 'Mac' : /Linux/i.test(ua) ? 'Linux' : 'نامشخص';
+  const br = /Edg\//i.test(ua) ? 'Edge' : /OPR\/|Opera/i.test(ua) ? 'Opera' : /Firefox/i.test(ua) ? 'Firefox' : /Chrome/i.test(ua) ? 'Chrome' : /Safari/i.test(ua) ? 'Safari' : 'مرورگر نامشخص';
+  return os + ' / ' + br;
+}
+// o: { cat, type, text, actor?, actorName?, target?, details?, net? }   (net = also store IP + device)
+function logEvent(req, o) {
+  try {
+    const actor = o.actor !== undefined ? o.actor : ((req && req.user) || null);
+    const e = {
+      id: uuid(), t: Date.now(), cat: o.cat, type: o.type, text: o.text,
+      actorId: actor ? actor.id : null, actorName: actor ? actor.displayName : (o.actorName || null),
+      targetId: o.target ? o.target.id : null, targetName: o.target ? o.target.displayName : null,
+      details: o.details || null
+    };
+    if (o.net && req) { e.ip = req.ip; e.device = deviceOf(req); }
+    fs.appendFile(LOG_FILE, JSON.stringify(e) + '\n', () => {});
+  } catch (err) { console.error('log failed:', err.message); }
+}
+function readLog() {
+  let raw = '';
+  try { raw = fs.readFileSync(LOG_FILE, 'utf8'); } catch (e) { return []; }
+  const out = [];
+  raw.split('\n').forEach(l => { if (!l) return; try { out.push(JSON.parse(l)); } catch (e) {} });
+  return out;
+}
+function pruneLog() {
+  try {
+    const cutoff = Date.now() - LOG_KEEP_MS;
+    const all = readLog();
+    const keep = all.filter(e => e.t >= cutoff);
+    if (keep.length !== all.length) {
+      fs.writeFileSync(LOG_FILE + '.tmp', keep.map(e => JSON.stringify(e)).join('\n') + (keep.length ? '\n' : ''));
+      fs.renameSync(LOG_FILE + '.tmp', LOG_FILE);
+    }
+  } catch (e) { console.error('pruneLog failed:', e.message); }
+}
+pruneLog();
+setInterval(pruneLog, DAY_MS).unref();
+
 // ---------- middleware ----------
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -88,14 +135,23 @@ function takeAttachment(id, user) {
   return { url: '/uploads/' + a.file, kind: a.kind, name: a.name };
 }
 
+// every user has a session version (sv); bumping it signs that user out everywhere
 function currentUser(req) {
   if (!req.session.userId) return null;
-  return db.get('users').find({ id: req.session.userId }).value() || null;
+  const u = db.get('users').find({ id: req.session.userId }).value() || null;
+  if (!u) return null;
+  if ((req.session.sv || 0) !== (u.sv || 0)) return null;
+  return u;
 }
 function requireAuth(req, res, next) {
   const u = currentUser(req);
   if (!u) return res.status(401).json({ error: 'ابتدا وارد شوید' });
   req.user = u;
+  // someone whose password was set by an admin must choose their own before doing anything else
+  if (u.mustChangePassword) {
+    const p = req.originalUrl.split('?')[0];
+    if (!(p === '/api/me' && req.method === 'PATCH')) return res.status(403).json({ error: 'برای ادامه ابتدا رمز عبور جدید خود را انتخاب کنید', mustChange: true });
+  }
   next();
 }
 function requireRole(...roles) {
@@ -117,12 +173,59 @@ function publicUser(u) {
 // includes fields nobody else should see (real name, email, phone)
 function privateProfile(u) {
   if (!u) return null;
-  return { ...publicUser(u), realName: u.realName || '', email: u.email || '', phone: u.phone || '' };
+  return {
+    ...publicUser(u), realName: u.realName || '', email: u.email || '', phone: u.phone || '',
+    perms: effectivePerms(u),
+    createdAt: u.createdAt || null, lastLoginAt: u.lastLoginAt || null,
+    phoneChangedAt: u.phoneChangedAt || null, emailChangedAt: u.emailChangedAt || null,
+    mustChangePassword: !!u.mustChangePassword, notice: u.securityNotice || null
+  };
 }
 // the "main admin" is the first person who ever registered
 function isOwnerUser(u) {
   const first = db.get('users').first().value();
   return !!u && !!first && first.id === u.id;
+}
+
+// ---------- permissions ----------
+// The main admin can do everything. Other admins get four switchable permissions:
+//   members (approve/block members) · passwords (reset members' passwords) · contact (handle messages to admin) · content (delete others' posts, manage halls/topics/files)
+const PERM_KEYS = ['members', 'passwords', 'contact', 'content'];
+function effectivePerms(u) {
+  const out = {};
+  if (!u) return out;
+  if (isOwnerUser(u)) { PERM_KEYS.forEach(k => { out[k] = true; }); return out; }
+  if (u.role !== 'admin') return out;
+  PERM_KEYS.forEach(k => { out[k] = !(u.perms && u.perms[k] === false); });
+  return out;
+}
+function hasPerm(u, ...keys) {
+  const p = effectivePerms(u);
+  return keys.some(k => p[k]);
+}
+function requirePerm(...keys) {
+  return (req, res, next) => {
+    if (!hasPerm(req.user, ...keys)) return res.status(403).json({ error: 'شما این دسترسی را ندارید (مدیر اصلی باید آن را فعال کند)' });
+    next();
+  };
+}
+function requireOwner(req, res, next) {
+  if (!isOwnerUser(req.user)) return res.status(403).json({ error: 'فقط مدیر اصلی سایت می‌تواند این کار را بکند' });
+  next();
+}
+// may `actor` change the role / password of `target`?  Nobody can touch the main admin;
+// other admins can only manage ordinary members; only the main admin manages other admins.
+function canManageAccount(actor, target) {
+  if (!actor || !target || actor.id === target.id) return false;
+  if (isOwnerUser(target)) return false;
+  if (isOwnerUser(actor)) return true;
+  return target.role !== 'admin';
+}
+// a visible heads-up for the account holder (shown in the app, and pushed live if they are online)
+function setSecurityNotice(target, actor, how) {
+  const notice = { at: Date.now(), by: actor ? actor.displayName : '', how };
+  db.get('users').find({ id: target.id }).assign({ securityNotice: notice }).write();
+  io.to(`user:${target.id}`).emit('securityNotice', notice);
 }
 
 // ---------- auth ----------
@@ -227,13 +330,16 @@ app.post('/api/auth/register', (req, res) => {
     role: isFirstUser ? 'admin' : 'pending', // first registered user becomes admin automatically
     createdAt: Date.now()
   };
+  user.lastLoginAt = Date.now();
   db.get('users').push(user).write();
   req.session.userId = user.id;
+  req.session.sv = 0;
+  logEvent(req, { cat: 'members', type: 'register', actor: user, text: `${user.displayName} (${user.username}) ثبت‌نام کرد${isFirstUser ? ' — اولین کاربر و مدیر اصلی' : ''}`, net: true });
   if (!isFirstUser) {
     io.to('admins').emit('newMember', { id: user.id, displayName: user.displayName, username: user.username });
     emitPendingCount();
   }
-  res.json({ user: publicUser(user) });
+  res.json({ user: privateProfile(user) });
 });
 
 // ---------- forgot / reset password ----------
@@ -273,21 +379,42 @@ app.post('/api/auth/reset', (req, res) => {
   if (newPassword !== confirmPassword) return res.status(400).json({ error: 'رمز جدید و تکرار آن یکسان نیستند' });
   const user = db.get('users').find({ id: rec.userId });
   if (!user.value()) return res.status(404).json({ error: 'کاربر پیدا نشد' });
-  user.assign({ passwordHash: bcrypt.hashSync(newPassword, 10) }).write();
+  const nsv = (user.value().sv || 0) + 1;     // sign the account out everywhere else
+  user.assign({ passwordHash: bcrypt.hashSync(newPassword, 10), sv: nsv, mustChangePassword: false, lastLoginAt: Date.now() }).write();
   db.get('resetTokens').remove(t => t.userId === rec.userId).write();
   req.session.userId = user.value().id;
-  res.json({ ok: true, user: publicUser(user.value()) });
+  req.session.sv = nsv;
+  const by = rec.by ? userById(rec.by) : null;
+  logEvent(req, { cat: 'security', type: 'password_reset_used', actor: user.value(), text: `${user.value().displayName} با لینک بازیابی رمز جدید گذاشت${by ? ` (لینک را ${by.displayName} ساخته بود)` : ' (لینک ایمیل)'}`, net: true });
+  io.disconnectSockets && io.in(`user:${user.value().id}`).disconnectSockets(true);
+  res.json({ ok: true, user: privateProfile(user.value()) });
 });
 
+// brute-force protection on login: 10 wrong passwords per 15 minutes per device+username
+const loginFails = new Map();
 app.post('/api/auth/login', (req, res) => {
   const { username, password } = req.body || {};
+  const key = req.ip + '|' + String(username || '').toLowerCase();
+  const now = Date.now();
+  const fails = (loginFails.get(key) || []).filter(t => now - t < 15 * 60 * 1000);
+  if (fails.length >= 10) {
+    if (fails.length === 10) logEvent(req, { cat: 'auth', type: 'login_blocked', actor: null, actorName: clip(username, 40), text: `ورود با نام کاربری «${clip(username, 40)}» به‌خاطر ۱۰ تلاش ناموفق موقتاً مسدود شد`, net: true });
+    fails.push(now); loginFails.set(key, fails);
+    return res.status(429).json({ error: 'تلاش‌های ناموفق زیاد بود. ۱۵ دقیقه بعد دوباره امتحان کنید.' });
+  }
   const user = db.get('users').find({ username }).value();
   if (!user || !bcrypt.compareSync(password || '', user.passwordHash)) {
+    fails.push(now); loginFails.set(key, fails);
+    logEvent(req, { cat: 'auth', type: 'login_fail', actor: null, actorName: clip(username, 40), target: user || null, text: `ورود ناموفق با نام کاربری «${clip(username, 40)}»${user ? '' : ' (چنین کاربری وجود ندارد)'}`, net: true });
     return res.status(400).json({ error: 'نام کاربری یا رمز عبور اشتباه است' });
   }
   if (user.role === 'blocked') return res.status(403).json({ error: 'دسترسی شما مسدود شده است' });
+  loginFails.delete(key);
   req.session.userId = user.id;
-  res.json({ user: publicUser(user) });
+  req.session.sv = user.sv || 0;
+  db.get('users').find({ id: user.id }).assign({ lastLoginAt: now }).write();
+  logEvent(req, { cat: 'auth', type: 'login_ok', actor: user, text: `${user.displayName} وارد شد`, net: true });
+  res.json({ user: privateProfile(db.get('users').find({ id: user.id }).value()) });
 });
 
 app.post('/api/auth/logout', (req, res) => {
@@ -307,13 +434,13 @@ app.get('/api/public/admin-contact', (req, res) => {
   res.json({ contact: { displayName: first.displayName, phone: first.phone || '' } });
 });
 
-// ---------- message to the main admin (works without logging in) ----------
-// Abuse protection: honeypot field, minimum fill-in time, length limits, and per-IP / per-username / global caps.
-function ipHash(req) { return crypto.createHash('sha256').update(String(req.ip) + SESSION_SECRET).digest('hex').slice(0, 16); }
+// ---------- message to the admins (works without logging in) ----------
+// Only an invisible honeypot field (for bots) and a length cap. Protection against impersonation
+// is on the admin side: the inbox shows the account's REGISTERED details and recovery goes
+// through the registered phone, never through what the message claims.
 app.post('/api/public/contact-admin', (req, res) => {
   const b = req.body || {};
-  if (b.website) return res.json({ ok: true });                                   // honeypot: bots fill hidden fields — pretend success
-  if (typeof b.elapsed === 'number' && b.elapsed < 1500) return res.status(400).json({ error: 'لطفاً پیام را کامل بنویسید و دوباره بفرستید.' });
+  if (b.website) return res.json({ ok: true });                                   // honeypot: only bots fill the hidden field
   const me = currentUser(req);
   const name = me ? me.displayName : String(b.name || '').trim().slice(0, 60);
   const username = me ? me.username : String(b.username || '').trim().slice(0, 40);
@@ -321,46 +448,59 @@ app.post('/api/public/contact-admin', (req, res) => {
   const text = String(b.text || '').trim();
   if (!name && !username) return res.status(400).json({ error: 'نام یا نام کاربری خود را بنویسید تا مدیر بداند پیام از کیست.' });
   if (text.length < 5) return res.status(400).json({ error: 'پیام خیلی کوتاه است.' });
-  if (text.length > 500) return res.status(400).json({ error: 'پیام حداکثر ۵۰۰ کاراکتر باشد.' });
-  const now = Date.now(), ih = ipHash(req);
-  const all = db.get('adminMessages').value();
-  const mine = all.filter(m => m.ip === ih);
-  if (mine.filter(m => now - m.time < 3600e3).length >= 3 || mine.filter(m => now - m.time < 86400e3).length >= 8)
-    return res.status(429).json({ error: 'تعداد پیام‌های شما از این دستگاه زیاد شده. کمی بعد دوباره امتحان کنید یا مستقیم با مدیر تماس بگیرید.' });
-  if (mine.some(m => m.text === text && now - m.time < 3600e3)) return res.status(429).json({ error: 'همین پیام را قبلاً فرستاده‌اید. مدیر به‌زودی می‌بیند.' });
+  if (text.length > 2000) return res.status(400).json({ error: 'پیام حداکثر ۲۰۰۰ کاراکتر باشد.' });
   const uname = username.toLowerCase();
-  if (uname && all.filter(m => !m.handled && (m.username || '').toLowerCase() === uname).length >= 3)
-    return res.status(429).json({ error: 'برای این نام کاربری چند پیام رسیدگی‌نشده هست. لطفاً منتظر پاسخ مدیر بمانید.' });
-  if (all.filter(m => !m.handled).length >= 300) return res.status(503).json({ error: 'صندوق پیام مدیر فعلاً پر است. لطفاً تماس تلفنی بگیرید.' });
   const matched = uname ? db.get('users').find(u => u.username.toLowerCase() === uname).value() : null;
-  const msg = { id: uuid(), name, username, contact, text, time: now, ip: ih, handled: false, userId: matched ? matched.id : null, loggedIn: !!me };
+  const msg = { id: uuid(), name, username, contact, text, time: Date.now(), handled: false, userId: matched ? matched.id : null, loggedIn: !!me };
   db.get('adminMessages').push(msg).write();
-  // keep the file small: past 500 messages, drop the oldest already-handled ones
   const list = db.get('adminMessages').value();
-  if (list.length > 500) {
-    const drop = list.filter(m => m.handled).sort((a, b) => a.time - b.time).slice(0, list.length - 500).map(m => m.id);
-    if (drop.length) db.get('adminMessages').remove(m => drop.includes(m.id)).write();
+  if (list.length > 2000) {                                   // keep the file small: drop the oldest (handled ones first)
+    const drop = list.slice().sort((x, y) => (x.handled === y.handled ? x.time - y.time : (x.handled ? -1 : 1))).slice(0, list.length - 2000).map(m => m.id);
+    db.get('adminMessages').remove(m => drop.includes(m.id)).write();
   }
-  io.to('owner').emit('adminMessage', { id: msg.id, name: msg.name || msg.username });
+  io.to('admins').emit('adminMessage', { id: msg.id, name: msg.name || msg.username });
+  logEvent(req, { cat: 'contact', type: 'contact_received', actor: me || null, actorName: me ? null : (msg.name || msg.username), text: `پیام تازه به مدیران از «${msg.name || msg.username}»${msg.username ? ` (نام کاربری: ${msg.username})` : ''}${me ? '' : ' — بدون ورود، هویت تایید‌نشده'}`, details: { text: clip(text, 600), contact }, net: true });
   res.json({ ok: true });
 });
 
-function adminMsgView(m) { const { ip, ...rest } = m; return rest; }
-app.get('/api/admin-messages', requireAuth, (req, res) => {
-  if (!isOwnerUser(req.user)) return res.status(403).json({ error: 'دسترسی غیرمجاز' });
-  const list = db.get('adminMessages').value().slice().sort((a, b) => b.time - a.time).map(adminMsgView);
+// what the admin sees next to a message: the account's REGISTERED data, never what the sender typed
+function adminMsgView(m, viewer) {
+  const { ip, ...rest } = m;
+  const u = m.userId ? userById(m.userId) : null;
+  let account = null;
+  if (u) {
+    const regPhone = String(u.phone || '').replace(/\D/g, '').slice(-10);
+    const typed = String(m.contact || '').replace(/\D/g, '').slice(-10);
+    const recent = (t) => !!t && Date.now() - t < 14 * DAY_MS;
+    account = {
+      id: u.id, displayName: u.displayName, username: u.username, realName: u.realName || '', phone: u.phone || '', email: u.email || '',
+      role: u.role, createdAt: u.createdAt || null, lastLoginAt: u.lastLoginAt || null,
+      phoneChangedAt: u.phoneChangedAt || null, emailChangedAt: u.emailChangedAt || null,
+      contactCheck: !typed ? 'none' : (typed === regPhone ? 'match' : 'mismatch'),
+      recentChange: recent(u.phoneChangedAt) || recent(u.emailChangedAt),
+      canRecover: hasPerm(viewer, 'passwords') && canManageAccount(viewer, u)
+    };
+  }
+  return { ...rest, account };
+}
+app.get('/api/admin-messages', requireAuth, requirePerm('contact'), (req, res) => {
+  const list = db.get('adminMessages').value().slice().sort((a, b) => b.time - a.time).map(m => adminMsgView(m, req.user));
   res.json({ messages: list, unhandled: list.filter(m => !m.handled).length });
 });
-app.post('/api/admin-messages/:id/handled', requireAuth, (req, res) => {
-  if (!isOwnerUser(req.user)) return res.status(403).json({ error: 'دسترسی غیرمجاز' });
+app.post('/api/admin-messages/:id/handled', requireAuth, requirePerm('contact'), (req, res) => {
   const m = db.get('adminMessages').find({ id: req.params.id });
-  if (!m.value()) return res.status(404).json({ error: 'پیام پیدا نشد' });
-  m.assign({ handled: !!(req.body || {}).handled }).write();
+  const cur = m.value();
+  if (!cur) return res.status(404).json({ error: 'پیام پیدا نشد' });
+  const handled = !!(req.body || {}).handled;
+  m.assign(handled ? { handled: true, handledBy: req.user.id, handledByName: req.user.displayName, handledAt: Date.now() } : { handled: false, handledBy: null, handledByName: null, handledAt: null }).write();
+  logEvent(req, { cat: 'contact', type: 'contact_handled', text: `${req.user.displayName} پیام «${cur.name || cur.username}» را ${handled ? 'رسیدگی‌شده علامت زد' : 'به حالت رسیدگی‌نشده برگرداند'}`, details: { text: clip(cur.text, 300) } });
   res.json({ ok: true });
 });
-app.delete('/api/admin-messages/:id', requireAuth, (req, res) => {
-  if (!isOwnerUser(req.user)) return res.status(403).json({ error: 'دسترسی غیرمجاز' });
+app.delete('/api/admin-messages/:id', requireAuth, requirePerm('contact'), (req, res) => {
+  const cur = db.get('adminMessages').find({ id: req.params.id }).value();
+  if (!cur) return res.json({ ok: true });
   db.get('adminMessages').remove({ id: req.params.id }).write();
+  logEvent(req, { cat: 'contact', type: 'contact_deleted', text: `${req.user.displayName} پیام «${cur.name || cur.username}» را از صندوق حذف کرد`, details: { text: clip(cur.text, 600), contact: cur.contact } });
   res.json({ ok: true });
 });
 
@@ -375,12 +515,12 @@ app.patch('/api/me', requireAuth, (req, res) => {
   if (phone !== undefined) {
     const ph = String(phone).replace(/[^\d+]/g, '');
     if (!PHONE_REGEX.test(ph)) return res.status(400).json({ error: 'شماره موبایل معتبر وارد کنید (مثال: 0912xxxxxxx)' });
-    changes.phone = ph;
+    if (ph !== (req.user.phone || '')) { changes.phone = ph; changes.phoneChangedAt = Date.now(); }
   }
   if (email !== undefined) {
     const em = String(email).trim();
     if (em && !EMAIL_REGEX.test(em)) return res.status(400).json({ error: 'ایمیل معتبر وارد کنید' });
-    changes.email = em;
+    if (em !== (req.user.email || '')) { changes.email = em; changes.emailChangedAt = Date.now(); }
   }
   if (realName !== undefined) changes.realName = String(realName).trim().slice(0, 80);
   if (education !== undefined) changes.education = String(education).trim().slice(0, 300);
@@ -391,9 +531,20 @@ app.patch('/api/me', requireAuth, (req, res) => {
     if (newPassword.length < 4) return res.status(400).json({ error: 'رمز جدید حداقل ۴ کاراکتر باشد' });
     if (newPassword !== confirmPassword) return res.status(400).json({ error: 'رمز جدید و تکرار آن یکسان نیستند' });
     changes.passwordHash = bcrypt.hashSync(newPassword, 10);
+    changes.sv = (req.user.sv || 0) + 1;              // other devices are signed out; this one stays
+    changes.mustChangePassword = false;
+    req.session.sv = changes.sv;
   }
   const u = db.get('users').find({ id: req.user.id });
+  const before = { ...req.user };
   u.assign(changes).write();
+  const diffs = [];
+  if (changes.displayName && changes.displayName !== before.displayName) diffs.push({ f: 'نام نمایشی', old: before.displayName, nw: changes.displayName });
+  if (changes.phone) diffs.push({ f: 'شماره موبایل', old: before.phone || '', nw: changes.phone });
+  if (changes.email !== undefined && changes.emailChangedAt) diffs.push({ f: 'ایمیل', old: before.email || '', nw: changes.email });
+  if (changes.realName !== undefined && changes.realName !== (before.realName || '')) diffs.push({ f: 'نام واقعی', old: before.realName || '', nw: changes.realName });
+  if (diffs.length) logEvent(req, { cat: 'members', type: 'profile_changed', text: `${before.displayName} این موارد پروفایل را تغییر داد: ${diffs.map(d => d.f).join('، ')}`, details: { changes: diffs.map(d => `${d.f}: «${clip(d.old, 60)}» ← «${clip(d.nw, 60)}»`) }, net: true });
+  if (changes.passwordHash) logEvent(req, { cat: 'security', type: 'password_changed_self', text: `${before.displayName} رمز عبور خودش را عوض کرد${before.mustChangePassword ? ' (رمز موقت را با رمز دلخواه عوض کرد)' : ''}`, net: true });
   if (changes.displayName) {
     db.get('messages').filter({ userId: req.user.id }).forEach(m => { m.authorName = changes.displayName; }).value();
     db.get('chatMessages').filter({ from: req.user.id }).forEach(m => { m.fromName = changes.displayName; }).value();
@@ -403,6 +554,11 @@ app.patch('/api/me', requireAuth, (req, res) => {
   }
   io.emit('userUpdated', publicUser(u.value()));
   res.json({ user: privateProfile(u.value()) });
+});
+
+app.post('/api/me/notice-ack', requireAuth, (req, res) => {
+  db.get('users').find({ id: req.user.id }).assign({ securityNotice: null }).write();
+  res.json({ ok: true });
 });
 
 app.get('/api/messages/:id', requireAuth, (req, res) => {
@@ -420,9 +576,9 @@ app.post('/api/attachments', requireAuth, requireRole('admin', 'member'), runUpl
 });
 
 // ---------- users / admin ----------
-app.get('/api/users', requireAuth, requireRole('admin'), (req, res) => {
+app.get('/api/users', requireAuth, requirePerm('members', 'passwords', 'contact'), (req, res) => {
   // admins get the identity-verification fields (real name, phone, email) too
-  res.json({ users: db.get('users').map(privateProfile).value() });
+  res.json({ users: db.get('users').map(u => { const { notice, ...rest } = privateProfile(u); return rest; }).value() });
 });
 
 // list of approved members (admin + member), for anyone to start a DM with —
@@ -436,32 +592,79 @@ app.get('/api/members', requireAuth, (req, res) => {
   res.json({ users: members });
 });
 
-app.post('/api/users/:id/role', requireAuth, requireRole('admin'), (req, res) => {
+app.post('/api/users/:id/role', requireAuth, requirePerm('members'), (req, res) => {
   const { role } = req.body || {};
-  if (!['admin', 'member', 'pending', 'blocked'].includes(role)) {
-    return res.status(400).json({ error: 'نقش نامعتبر' });
-  }
+  if (!['admin', 'member', 'pending', 'blocked'].includes(role)) return res.status(400).json({ error: 'نقش نامعتبر' });
   const target = db.get('users').find({ id: req.params.id });
-  if (!target.value()) return res.status(404).json({ error: 'کاربر پیدا نشد' });
-  target.assign({ role }).write();
+  const t = target.value();
+  if (!t) return res.status(404).json({ error: 'کاربر پیدا نشد' });
+  if (isOwnerUser(t)) return res.status(403).json({ error: 'نقش مدیر اصلی قابل تغییر نیست' });
+  if (t.id === req.user.id) return res.status(403).json({ error: 'نقش خودتان را نمی‌توانید تغییر دهید' });
+  if (!isOwnerUser(req.user)) {
+    if (t.role === 'admin') return res.status(403).json({ error: 'فقط مدیر اصلی می‌تواند وضعیت مدیرهای دیگر را تغییر دهد' });
+    if (role === 'admin') return res.status(403).json({ error: 'فقط مدیر اصلی می‌تواند کسی را مدیر کند' });
+  }
+  if (t.role === role) return res.json({ ok: true });
+  const changes = { role };
+  if (role === 'admin') changes.perms = { members: true, passwords: true, contact: true, content: true };   // new admins start with everything; the main admin can switch items off
+  if (role === 'blocked') changes.sv = (t.sv || 0) + 1;       // kick out of all sessions
+  target.assign(changes).write();
+  if (t.role === 'admin' && role !== 'admin') db.get('users').find({ id: t.id }).unset('perms').write();
+  if (role === 'blocked') io.in(`user:${t.id}`).disconnectSockets(true);
+  logEvent(req, { cat: 'members', type: 'role_changed', target: t, text: `${req.user.displayName} وضعیت «${t.displayName}» را از «${roleLabel(t.role)}» به «${roleLabel(role)}» تغییر داد`, details: { from: t.role, to: role } });
   io.emit('userUpdated', publicUser(target.value()));
   emitPendingCount();
   res.json({ ok: true });
 });
+function roleLabel(r) { return { admin: 'مدیر', member: 'عضو', pending: 'در انتظار تایید', blocked: 'مسدود' }[r] || r; }
 
-// admin sets a brand-new password for a member (e.g. they forgot theirs and
-// contacted the admin directly) — the admin never sees the old password,
-// since it's hashed and unrecoverable; this issues a fresh one instead
-app.post('/api/users/:id/set-password', requireAuth, requireRole('admin'), (req, res) => {
+// main admin decides which abilities each other admin has
+app.patch('/api/users/:id/perms', requireAuth, requireOwner, (req, res) => {
+  const t = userById(req.params.id);
+  if (!t) return res.status(404).json({ error: 'کاربر پیدا نشد' });
+  if (t.role !== 'admin' || isOwnerUser(t)) return res.status(400).json({ error: 'دسترسی‌ها فقط برای مدیرهای دیگر قابل تنظیم است' });
+  const cur = effectivePerms(t);
+  const inc = (req.body || {}).perms || {};
+  const next = {};
+  PERM_KEYS.forEach(k => { next[k] = typeof inc[k] === 'boolean' ? inc[k] : cur[k]; });
+  db.get('users').find({ id: t.id }).assign({ perms: next }).write();
+  io.to(`user:${t.id}`).emit('permsChanged', { perms: next });
+  const names = { members: 'اعضا', passwords: 'رمزها', contact: 'پیام‌های مدیر', content: 'محتوا' };
+  logEvent(req, { cat: 'members', type: 'perms_changed', target: t, text: `${req.user.displayName} دسترسی‌های «${t.displayName}» را تغییر داد`, details: { changes: PERM_KEYS.filter(k => cur[k] !== next[k]).map(k => `${names[k]}: ${next[k] ? 'فعال شد' : 'غیرفعال شد'}`) } });
+  res.json({ ok: true, perms: next });
+});
+
+// admin-set password is TEMPORARY: the person must choose their own at next login, so the admin never
+// knows the final password. The account holder also gets a visible notice.
+app.post('/api/users/:id/set-password', requireAuth, requirePerm('passwords'), (req, res) => {
   const { newPassword } = req.body || {};
   if (!newPassword || newPassword.length < 4) return res.status(400).json({ error: 'رمز جدید حداقل ۴ کاراکتر باشد' });
-  const target = db.get('users').find({ id: req.params.id });
-  if (!target.value()) return res.status(404).json({ error: 'کاربر پیدا نشد' });
-  target.assign({ passwordHash: bcrypt.hashSync(newPassword, 10) }).write();
+  const t = userById(req.params.id);
+  if (!t) return res.status(404).json({ error: 'کاربر پیدا نشد' });
+  if (t.id === req.user.id) return res.status(400).json({ error: 'رمز خودتان را از بخش «پروفایل» عوض کنید' });
+  if (!canManageAccount(req.user, t)) return res.status(403).json({ error: isOwnerUser(t) ? 'رمز مدیر اصلی را هیچ مدیر دیگری نمی‌تواند عوض کند' : 'رمز مدیرهای دیگر را فقط مدیر اصلی می‌تواند عوض کند' });
+  db.get('users').find({ id: t.id }).assign({ passwordHash: bcrypt.hashSync(newPassword, 10), mustChangePassword: true }).write();
+  setSecurityNotice(t, req.user, 'temp-password');
+  logEvent(req, { cat: 'security', type: 'password_set_by_admin', target: t, text: `${req.user.displayName} برای «${t.displayName}» رمز موقت تعیین کرد`, details: { registeredPhone: t.phone || '' } });
   res.json({ ok: true });
 });
 
-app.get('/api/pending-count', requireAuth, requireRole('admin'), (req, res) => {
+// one-time recovery link (1 hour): the admin sends it to the account's REGISTERED phone;
+// the person picks their own new password, so nobody else ever learns it
+app.post('/api/users/:id/recovery-link', requireAuth, requirePerm('passwords'), (req, res) => {
+  const t = userById(req.params.id);
+  if (!t) return res.status(404).json({ error: 'کاربر پیدا نشد' });
+  if (t.id === req.user.id) return res.status(400).json({ error: 'برای خودتان از «فراموشی رمز» استفاده کنید' });
+  if (!canManageAccount(req.user, t)) return res.status(403).json({ error: isOwnerUser(t) ? 'برای مدیر اصلی لینک بازیابی ساخته نمی‌شود' : 'برای مدیرهای دیگر فقط مدیر اصلی لینک می‌سازد' });
+  db.get('resetTokens').remove(x => x.userId === t.id).write();
+  const token = uuid();
+  db.get('resetTokens').push({ token, userId: t.id, expires: Date.now() + 60 * 60 * 1000, by: req.user.id }).write();
+  setSecurityNotice(t, req.user, 'recovery-link');
+  logEvent(req, { cat: 'security', type: 'recovery_link', target: t, text: `${req.user.displayName} برای «${t.displayName}» لینک بازیابی رمز (یک ساعته) ساخت`, details: { registeredPhone: t.phone || '' } });
+  res.json({ link: `${publicUrl(req)}/?reset=${token}`, phone: t.phone || '', displayName: t.displayName });
+});
+
+app.get('/api/pending-count', requireAuth, requirePerm('members'), (req, res) => {
   res.json({ count: db.get('users').filter({ role: 'pending' }).size().value() });
 });
 function emitPendingCount() {
@@ -479,6 +682,7 @@ app.patch('/api/settings', requireAuth, (req, res) => {
   if (!isOwnerUser(req.user)) return res.status(403).json({ error: 'فقط مدیر اصلی سایت می‌تواند تنظیمات را تغییر دهد' });
   const { topicOpenMode, recoveryMethod } = req.body || {};
   const next = readSettings();
+  const beforeSettings = { ...next };
   if (recoveryMethod !== undefined) {
     if (!['admin', 'email', 'both'].includes(recoveryMethod)) return res.status(400).json({ error: 'مقدار نامعتبر' });
     if (recoveryMethod !== 'admin' && !mailTransport) return res.status(400).json({ error: 'ارسال ایمیل هنوز روی سرور راه‌اندازی نشده (تنظیمات SMTP در Railway لازم است)، پس فعلاً فقط «تماس با مدیر» قابل انتخاب است.' });
@@ -489,6 +693,8 @@ app.patch('/api/settings', requireAuth, (req, res) => {
     next.topicOpenMode = topicOpenMode;
   }
   db.set('meta.settings', next).write();
+  const sn = { topicOpenMode: 'نحوه‌ی باز شدن تاپیک', recoveryMethod: 'روش بازیابی رمز' };
+  Object.keys(next).filter(k => next[k] !== beforeSettings[k]).forEach(k => logEvent(req, { cat: 'settings', type: 'settings_changed', text: `${req.user.displayName} تنظیم «${sn[k] || k}» را از «${beforeSettings[k]}» به «${next[k]}» تغییر داد` }));
   io.emit('settingsChanged', next);
   res.json({ settings: next });
 });
@@ -497,15 +703,16 @@ app.patch('/api/settings', requireAuth, (req, res) => {
 app.get('/api/halls', requireAuth, (req, res) => {
   res.json({ halls: db.get('halls').value() });
 });
-app.post('/api/halls', requireAuth, requireRole('admin'), (req, res) => {
+app.post('/api/halls', requireAuth, requirePerm('content'), (req, res) => {
   const { title, description } = req.body || {};
   if (!title || !title.trim()) return res.status(400).json({ error: 'عنوان تالار لازم است' });
   const hall = { id: uuid(), title: title.trim().slice(0, 100), description: (description || '').trim().slice(0, 200), createdAt: Date.now() };
   db.get('halls').push(hall).write();
   io.emit('hallsChanged');
+  logEvent(req, { cat: 'content', type: 'hall_created', text: `${req.user.displayName} تالار «${hall.title}» را ساخت` });
   res.json({ hall });
 });
-app.patch('/api/halls/:id', requireAuth, requireRole('admin'), (req, res) => {
+app.patch('/api/halls/:id', requireAuth, requirePerm('content'), (req, res) => {
   const hall = db.get('halls').find({ id: req.params.id });
   if (!hall.value()) return res.status(404).json({ error: 'تالار پیدا نشد' });
   const { title, description } = req.body || {};
@@ -515,7 +722,9 @@ app.patch('/api/halls/:id', requireAuth, requireRole('admin'), (req, res) => {
     changes.title = String(title).trim().slice(0, 100);
   }
   if (description !== undefined) changes.description = String(description).trim().slice(0, 200);
+  const hallBefore = { ...hall.value() };
   hall.assign(changes).write();
+  logEvent(req, { cat: 'content', type: 'hall_edited', text: `${req.user.displayName} تالار «${hallBefore.title}» را ویرایش کرد${changes.title && changes.title !== hallBefore.title ? ` (عنوان جدید: «${changes.title}»)` : ''}`, details: { before: clip(hallBefore.title + ' — ' + (hallBefore.description || ''), 300), after: clip((changes.title || hallBefore.title) + ' — ' + (changes.description !== undefined ? changes.description : (hallBefore.description || '')), 300) } });
   io.emit('hallsChanged');
   res.json({ hall: hall.value() });
 });
@@ -536,7 +745,7 @@ function notifyUsers(ids, exceptId, payload) {
   ids.forEach(id => { if (id !== exceptId) io.to(`user:${id}`).emit('notify', payload); });
 }
 
-app.post('/api/topics', requireAuth, requireRole('admin'), (req, res) => {
+app.post('/api/topics', requireAuth, requirePerm('content'), (req, res) => {
   const { title, description, hallId } = req.body || {};
   if (!title || !title.trim()) return res.status(400).json({ error: 'عنوان لازم است' });
   if (!hallId) return res.status(400).json({ error: 'زیرموضوع باید داخل یک تالار اختصاصی ساخته شود' });
@@ -544,10 +753,11 @@ app.post('/api/topics', requireAuth, requireRole('admin'), (req, res) => {
   const topic = { id: uuid(), hallId: hallId, title: title.trim().slice(0, 100), description: (description || '').trim().slice(0, 200), pdfFile: null, pdfName: null, createdAt: Date.now() };
   db.get('topics').push(topic).write();
   io.emit('newTopic', topic);
+  logEvent(req, { cat: 'content', type: 'topic_created', text: `${req.user.displayName} تاپیک «${topic.title}» را ساخت` });
   res.json({ topic });
 });
 
-app.patch('/api/topics/:id', requireAuth, requireRole('admin'), (req, res) => {
+app.patch('/api/topics/:id', requireAuth, requirePerm('content'), (req, res) => {
   const topic = db.get('topics').find({ id: req.params.id });
   if (!topic.value()) return res.status(404).json({ error: 'تاپیک پیدا نشد' });
   const { title, description, hallId } = req.body || {};
@@ -561,13 +771,15 @@ app.patch('/api/topics/:id', requireAuth, requireRole('admin'), (req, res) => {
     if (hallId && !db.get('halls').find({ id: hallId }).value()) return res.status(400).json({ error: 'تالار انتخاب‌شده پیدا نشد' });
     changes.hallId = hallId || null;
   }
+  const topicBefore = { ...topic.value() };
   topic.assign(changes).write();
+  logEvent(req, { cat: 'content', type: 'topic_edited', text: `${req.user.displayName} تاپیک «${topicBefore.title}» را ویرایش کرد${changes.title && changes.title !== topicBefore.title ? ` (عنوان جدید: «${changes.title}»)` : ''}`, details: { before: clip(topicBefore.title + ' — ' + (topicBefore.description || ''), 300), after: clip((changes.title || topicBefore.title) + ' — ' + (changes.description !== undefined ? changes.description : (topicBefore.description || '')), 300) } });
   io.emit('topicUpdated', topic.value());
   notifyUsers(topicAudience(req.params.id), req.user.id, { kind: 'topic', topicId: req.params.id, topicTitle: topic.value().title, from: req.user.displayName, text: 'عنوان یا توضیح این تالار تغییر کرد' });
   res.json({ topic: topic.value() });
 });
 
-app.delete('/api/topics/:id', requireAuth, requireRole('admin'), (req, res) => {
+app.delete('/api/topics/:id', requireAuth, requirePerm('content'), (req, res) => {
   const topic = db.get('topics').find({ id: req.params.id });
   const t = topic.value();
   if (!t) return res.status(404).json({ error: 'تاپیک پیدا نشد' });
@@ -580,6 +792,7 @@ app.delete('/api/topics/:id', requireAuth, requireRole('admin'), (req, res) => {
       db.get('attachments').remove({ file }).write();
     }
   });
+  logEvent(req, { cat: 'content', type: 'topic_deleted', text: `${req.user.displayName} تاپیک «${t.title}» را با ${msgs.length} پیام حذف کرد`, details: { description: clip(t.description || '', 200), pdf: t.pdfName || '', messages: msgs.length } });
   db.get('messages').remove({ topicId: t.id }).write();
   if (t.pdfFile) removeUploadedFile(t.pdfFile);
   db.get('topics').remove({ id: t.id }).write();
@@ -592,23 +805,26 @@ function removeUploadedFile(name) {
   fs.unlink(path.join(uploadsDir, name), () => {});
 }
 
-app.post('/api/topics/:id/pdf', requireAuth, requireRole('admin'), runUpload(upload, 'pdf'), (req, res) => {
+app.post('/api/topics/:id/pdf', requireAuth, requirePerm('content'), runUpload(upload, 'pdf'), (req, res) => {
   const topic = db.get('topics').find({ id: req.params.id });
   if (!topic.value()) { if (req.file) removeUploadedFile(req.file.filename); return res.status(404).json({ error: 'تاپیک پیدا نشد' }); }
   if (!req.file) return res.status(400).json({ error: 'فایلی انتخاب نشده' });
   const old = topic.value().pdfFile;
   topic.assign({ pdfFile: req.file.filename, pdfName: fixFileName(req.file.originalname) }).write();
+  logEvent(req, { cat: 'content', type: 'pdf_uploaded', text: `${req.user.displayName} فایل «${fixFileName(req.file.originalname)}» را در تاپیک «${topic.value().title}» ${old ? 'جایگزین کرد' : 'بارگذاری کرد'}` });
   if (old) removeUploadedFile(old);
   io.emit('topicUpdated', topic.value());
   notifyUsers(topicAudience(req.params.id), req.user.id, { kind: 'topic', topicId: req.params.id, topicTitle: topic.value().title, from: req.user.displayName, text: 'فایل جدیدی بارگذاری شد' });
   res.json({ topic: topic.value() });
 });
 
-app.delete('/api/topics/:id/pdf', requireAuth, requireRole('admin'), (req, res) => {
+app.delete('/api/topics/:id/pdf', requireAuth, requirePerm('content'), (req, res) => {
   const topic = db.get('topics').find({ id: req.params.id });
   if (!topic.value()) return res.status(404).json({ error: 'تاپیک پیدا نشد' });
   const old = topic.value().pdfFile;
+  const oldName = topic.value().pdfName;
   topic.assign({ pdfFile: null, pdfName: null }).write();
+  logEvent(req, { cat: 'content', type: 'pdf_deleted', text: `${req.user.displayName} فایل «${oldName || ''}» را از تاپیک «${topic.value().title}» حذف کرد` });
   if (old) removeUploadedFile(old);
   io.emit('topicUpdated', topic.value());
   res.json({ topic: topic.value() });
@@ -695,16 +911,19 @@ app.patch('/api/messages/:id', requireAuth, requireRole('admin', 'member'), (req
   if (!text && !cur.attachment) return res.status(400).json({ error: 'متن پیام خالی است' });
   if (text.length > 4000) return res.status(400).json({ error: 'پیام خیلی طولانی است' });
   if (text === cur.text) return res.json({ message: cur });
+  const tpe = db.get('topics').find({ id: cur.topicId }).value();
+  logEvent(req, { cat: 'content', type: 'message_edited', text: `${req.user.displayName} پیام خودش را در «${tpe ? tpe.title : '؟'}» ویرایش کرد`, details: { old: clip(cur.text, 1500), new: clip(text, 1500) } });
   m.assign({ text, edited: true, editedAt: Date.now() }).write();
   io.emit('messageUpdated', m.value());
   res.json({ message: m.value() });
 });
 
-app.post('/api/messages/:id/pin', requireAuth, requireRole('admin'), (req, res) => {
+app.post('/api/messages/:id/pin', requireAuth, requirePerm('content'), (req, res) => {
   const { pinned } = req.body || {};
   const m = db.get('messages').find({ id: req.params.id });
   if (!m.value()) return res.status(404).json({ error: 'پیام پیدا نشد' });
   m.assign({ pinned: !!pinned }).write();
+  logEvent(req, { cat: 'content', type: 'pin', text: `${req.user.displayName} یک پیام از «${m.value().authorName}» را ${pinned ? 'پین کرد' : 'از پین برداشت'}`, details: { text: clip(m.value().text, 200) } });
   io.emit('messageUpdated', m.value());
   res.json({ message: m.value() });
 });
@@ -712,9 +931,11 @@ app.post('/api/messages/:id/pin', requireAuth, requireRole('admin'), (req, res) 
 app.delete('/api/messages/:id', requireAuth, (req, res) => {
   const m = db.get('messages').find({ id: req.params.id }).value();
   if (!m) return res.status(404).json({ error: 'پیام پیدا نشد' });
-  if (req.user.role !== 'admin' && m.userId !== req.user.id) {
+  if (m.userId !== req.user.id && !hasPerm(req.user, 'content')) {
     return res.status(403).json({ error: 'دسترسی غیرمجاز' });
   }
+  const tp = db.get('topics').find({ id: m.topicId }).value();
+  logEvent(req, { cat: 'content', type: 'message_deleted', text: `${req.user.displayName} پیام «${m.authorName}» در «${tp ? tp.title : '؟'}» را حذف کرد${m.userId === req.user.id ? ' (پیام خودش)' : ''}`, details: { text: clip(m.text, 1500), attachment: m.attachment ? m.attachment.name : '', author: m.authorName, sentAt: m.time } });
   db.get('messages').remove({ id: req.params.id }).write();
   io.emit('messageDeleted', { id: req.params.id, topicId: m.topicId });
   res.json({ ok: true });
@@ -784,6 +1005,7 @@ function convView(c, viewerId) {
     visible: !cleared || !!last   // a cleared chat reappears only when a newer message arrives
   };
 }
+function chatTitle(c) { return c.title || c.members.map(id => (userById(id) || {}).displayName).filter(Boolean).join('، '); }
 function convRooms(c) {
   let target = io;
   c.members.forEach(id => { target = target.to(`user:${id}`); });
@@ -863,6 +1085,8 @@ app.patch('/api/chatmsg/:id', requireAuth, requireRole('admin', 'member'), (req,
   if (!text && !cur.attachment) return res.status(400).json({ error: 'متن پیام خالی است' });
   if (text.length > 4000) return res.status(400).json({ error: 'پیام خیلی طولانی است' });
   if (text === cur.text) return res.json({ message: cur });
+  const ce = db.get('conversations').find({ id: cur.convId }).value();
+  logEvent(req, { cat: 'chats', type: 'chat_edited', text: `${req.user.displayName} پیام خودش را در گفتگوی خصوصی ${ce ? '(' + chatTitle(ce) + ')' : ''} ویرایش کرد`, details: { old: clip(cur.text, 1500), new: clip(text, 1500) } });
   m.assign({ text, edited: true, editedAt: Date.now() }).write();
   const c = db.get('conversations').find({ id: cur.convId }).value();
   if (c) convRooms(c).emit('chatMessageUpdated', { msg: m.value() });
@@ -872,6 +1096,8 @@ app.delete('/api/chatmsg/:id', requireAuth, (req, res) => {
   const m = db.get('chatMessages').find({ id: req.params.id }).value();
   if (!m) return res.status(404).json({ error: 'پیام پیدا نشد' });
   if (m.from !== req.user.id) return res.status(403).json({ error: 'فقط پیام‌های خودتان را می‌توانید حذف کنید' });
+  const cd = db.get('conversations').find({ id: m.convId }).value();
+  logEvent(req, { cat: 'chats', type: 'chat_deleted', text: `${req.user.displayName} پیام خودش را از گفتگوی خصوصی ${cd ? '(' + chatTitle(cd) + ')' : ''} حذف کرد`, details: { text: clip(m.text, 1500), attachment: m.attachment ? m.attachment.name : '', sentAt: m.time } });
   db.get('chatMessages').remove({ id: m.id }).write();
   const c = db.get('conversations').find({ id: m.convId }).value();
   if (c) convRooms(c).emit('chatMessageDeleted', { id: m.id, convId: m.convId });
@@ -889,6 +1115,121 @@ app.post('/api/convs/:id/clear', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
+// ---------- activity log API (main admin only) ----------
+function parseYmd(str) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(str || '');
+  return m ? Date.UTC(+m[1], +m[2] - 1, +m[3]) - TEHRAN_OFFSET : null;
+}
+function logRange(q) {
+  const now = Date.now();
+  const dayStart = Math.floor((now + TEHRAN_OFFSET) / DAY_MS) * DAY_MS - TEHRAN_OFFSET;
+  let from = 0, to = Infinity;
+  if (q.range === 'today') from = dayStart;
+  else if (q.range === 'yesterday') { from = dayStart - DAY_MS; to = dayStart; }
+  else if (q.range === '7d') from = dayStart - 6 * DAY_MS;
+  else if (q.range === '30d') from = dayStart - 29 * DAY_MS;
+  const f = parseYmd(q.from), t = parseYmd(q.to);
+  if (f != null) from = f;
+  if (t != null) to = t + DAY_MS;
+  return { from, to };
+}
+function logFilter(q) {
+  const { from, to } = logRange(q);
+  const inRange = readLog().filter(e => e.t >= from && e.t < to);
+  const needle = q.q ? normFa(String(q.q).trim()) : '';
+  const list = inRange.filter(e => {
+    if (q.cat && e.cat !== q.cat) return false;
+    if (q.actor && e.actorId !== q.actor && e.targetId !== q.actor) return false;
+    if (needle) {
+      const hay = normFa([e.text, e.actorName, e.targetName, e.details ? JSON.stringify(e.details) : ''].join(' '));
+      if (!hay.includes(needle)) return false;
+    }
+    return true;
+  });
+  list.sort((a, b) => b.t - a.t);
+  return { inRange, list };
+}
+app.get('/api/logs', requireAuth, requireOwner, (req, res) => {
+  const { inRange, list } = logFilter(req.query);
+  const off = Math.max(0, parseInt(req.query.offset, 10) || 0);
+  const count = (...types) => inRange.filter(e => types.includes(e.type)).length;
+  res.json({
+    entries: list.slice(off, off + 100), total: list.length,
+    summary: {
+      total: inRange.length, logins: count('login_ok'), loginFails: count('login_fail', 'login_blocked'), registrations: count('register'),
+      roleChanges: count('role_changed', 'perms_changed'), edits: count('message_edited', 'chat_edited', 'topic_edited', 'hall_edited'),
+      deletes: count('message_deleted', 'chat_deleted', 'topic_deleted', 'pdf_deleted'), security: count('password_set_by_admin', 'recovery_link', 'password_reset_used', 'password_changed_self', 'owner_recovered', 'owner_reset_env', 'recovery_code_created'),
+      contact: count('contact_received')
+    }
+  });
+});
+app.get('/api/logs/export', requireAuth, requireOwner, (req, res) => {
+  const { list } = logFilter(req.query);
+  const fmt = (t) => new Date(t).toLocaleString('fa-IR', { timeZone: 'Asia/Tehran' });
+  const cell = (v) => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+  const rows = [['زمان', 'دسته', 'انجام‌دهنده', 'شرح', 'جزئیات', 'IP', 'دستگاه'].map(cell).join(',')];
+  list.slice(0, 20000).forEach(e => rows.push([fmt(e.t), e.cat, e.actorName || '', e.text, e.details ? JSON.stringify(e.details) : '', e.ip || '', e.device || ''].map(cell).join(',')));
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="activity-log.csv"');
+  res.send('\ufeff' + rows.join('\r\n'));
+});
+
+// ---------- emergency recovery for the main admin ----------
+// 1) a recovery code the main admin creates in advance (shown once, stored only as a hash)
+// 2) OWNER_RESET_PASSWORD env var on Railway (last resort; applied once per distinct value)
+function makeRecoveryCode() {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';        // 32 symbols, no look-alikes
+  const bytes = crypto.randomBytes(20);
+  let c = '';
+  for (let i = 0; i < 20; i++) c += alphabet[bytes[i] % 32];
+  return c.match(/.{5}/g).join('-');
+}
+const normCode = (x) => String(x || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+app.get('/api/owner/recovery-status', requireAuth, requireOwner, (req, res) => {
+  const m = db.get('meta').value() || {};
+  res.json({ exists: !!m.ownerRecoveryHash, at: m.ownerRecoveryAt || null });
+});
+app.post('/api/owner/recovery-code', requireAuth, requireOwner, (req, res) => {
+  if (!bcrypt.compareSync((req.body || {}).currentPassword || '', req.user.passwordHash)) return res.status(400).json({ error: 'رمز عبور فعلی اشتباه است' });
+  const code = makeRecoveryCode();
+  db.set('meta.ownerRecoveryHash', bcrypt.hashSync(normCode(code), 10)).set('meta.ownerRecoveryAt', Date.now()).write();
+  logEvent(req, { cat: 'security', type: 'recovery_code_created', text: `${req.user.displayName} کد بازیابی اضطراری جدید ساخت` });
+  res.json({ code });
+});
+const recoverAttempts = [];
+app.post('/api/auth/owner-recover', (req, res) => {
+  const now = Date.now();
+  while (recoverAttempts.length && now - recoverAttempts[0].t > 3600e3) recoverAttempts.shift();
+  if (recoverAttempts.filter(a => a.ip === req.ip).length >= 5 || recoverAttempts.length >= 20) return res.status(429).json({ error: 'تلاش‌های زیاد. یک ساعت بعد دوباره امتحان کنید.' });
+  const { username, code, newPassword, confirmPassword } = req.body || {};
+  const owner = db.get('users').first().value();
+  const hash = (db.get('meta').value() || {}).ownerRecoveryHash;
+  const fail = () => { recoverAttempts.push({ t: now, ip: req.ip }); logEvent(req, { cat: 'security', type: 'owner_recover_fail', actor: null, actorName: clip(username, 40), text: 'تلاش ناموفق برای بازیابی حساب مدیر اصلی با کد', net: true }); return res.status(400).json({ error: 'نام کاربری یا کد بازیابی اشتباه است' }); };
+  if (!owner || !hash || String(username || '') !== owner.username || !bcrypt.compareSync(normCode(code), hash)) return fail();
+  if (!newPassword || newPassword.length < 4) return res.status(400).json({ error: 'رمز جدید حداقل ۴ کاراکتر باشد' });
+  if (newPassword !== confirmPassword) return res.status(400).json({ error: 'رمز جدید و تکرار آن یکسان نیستند' });
+  const nsv = (owner.sv || 0) + 1;
+  db.get('users').find({ id: owner.id }).assign({ passwordHash: bcrypt.hashSync(newPassword, 10), sv: nsv, mustChangePassword: false, lastLoginAt: now }).write();
+  db.unset('meta.ownerRecoveryHash').unset('meta.ownerRecoveryAt').write();          // single use
+  req.session.userId = owner.id; req.session.sv = nsv;
+  logEvent(req, { cat: 'security', type: 'owner_recovered', actor: owner, text: `حساب مدیر اصلی با کد بازیابی اضطراری بازیابی شد (کد مصرف شد)`, net: true });
+  io.in(`user:${owner.id}`).disconnectSockets(true);
+  res.json({ ok: true, user: privateProfile(db.get('users').find({ id: owner.id }).value()) });
+});
+(function ownerResetFromEnv() {
+  const pw = process.env.OWNER_RESET_PASSWORD;
+  if (!pw) return;
+  const owner = db.get('users').first().value();
+  if (!owner) return;
+  if (pw.length < 6) { console.warn('⚠️  OWNER_RESET_PASSWORD باید حداقل ۶ کاراکتر باشد؛ نادیده گرفته شد.'); return; }
+  const h = crypto.createHash('sha256').update(pw).digest('hex');
+  if (((db.get('meta').value() || {}).envResetHash) === h) return;                    // already applied for this value
+  db.get('users').find({ id: owner.id }).assign({ passwordHash: bcrypt.hashSync(pw, 10), sv: (owner.sv || 0) + 1, mustChangePassword: false }).write();
+  db.set('meta.envResetHash', h).write();
+  logEvent(null, { cat: 'security', type: 'owner_reset_env', actor: owner, text: 'رمز مدیر اصلی با متغیر OWNER_RESET_PASSWORD در Railway بازنشانی شد' });
+  console.warn('🔐 رمز مدیر اصلی با OWNER_RESET_PASSWORD عوض شد. حالا این متغیر را از Railway پاک کنید.');
+})();
+
 // ---------- socket.io: presence + private rooms ----------
 const onlineUsers = new Map(); // userId -> {displayName, lastSeen}
 function presenceList() { return Array.from(onlineUsers.entries()).map(([id, v]) => ({ id, ...v })); }
@@ -898,7 +1239,7 @@ io.on('connection', (socket) => {
   const userId = sess && sess.userId;
   if (!userId) { socket.disconnect(); return; }
   const user = db.get('users').find({ id: userId }).value();
-  if (!user) { socket.disconnect(); return; }
+  if (!user || (sess.sv || 0) !== (user.sv || 0)) { socket.disconnect(); return; }
 
   socket.join(`user:${userId}`);
   if (isOwnerUser(user)) socket.join('owner');
